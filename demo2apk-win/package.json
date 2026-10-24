@@ -1,0 +1,34 @@
+{
+  "name": "demo2apk",
+  "version": "2.3.0",
+  "private": true,
+  "description": "Online HTML/React to APK build service",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/DeadWaveWave/demo2apk.git"
+  },
+  "scripts": {
+    "build": "pnpm -r build",
+    "dev": "pnpm --filter @demo2apk/backend dev",
+    "worker": "pnpm --filter @demo2apk/backend worker",
+    "test": "pnpm -r test",
+    "test:core": "pnpm --filter @demo2apk/core test",
+    "test:backend": "pnpm --filter @demo2apk/backend test",
+    "frontend": "pnpm --filter @demo2apk/frontend dev",
+    "clean": "rimraf packages/*/dist packages/*/node_modules node_modules",
+    "offlineify": "node packages/core/dist/utils/offlineify.js",
+    "log:stats": "pnpm --filter @demo2apk/backend log:stats",
+    "log:stats:types": "pnpm --filter @demo2apk/backend log:stats -- --types",
+    "log:stats:apps": "pnpm --filter @demo2apk/backend log:stats -- --apps"
+  },
+  "devDependencies": {
+    "adm-zip": "^0.5.17",
+    "rimraf": "^6.1.3",
+    "typescript": "^5.6.3"
+  },
+  "engines": {
+    "node": ">=20.0.0",
+    "pnpm": ">=9.0.0"
+  },
+  "packageManager": "pnpm@9.12.0"
+}

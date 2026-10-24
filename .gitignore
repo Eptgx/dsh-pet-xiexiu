@@ -1,0 +1,24 @@
+# 依赖与构建产物
+node_modules/
+dist/
+build/
+builds/
+*.log
+
+# 环境与密钥
+.env
+.env.local
+*.pem
+*.keystore
+*.jks
+
+# 打包中间产物
+*.zip
+*.apk
+*.aab
+
+# 编辑器 / 系统
+.DS_Store
+.idea/
+.vscode/
+.claude/

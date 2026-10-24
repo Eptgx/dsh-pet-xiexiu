@@ -1,0 +1,185 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
+    <meta name="theme-color" content="#0F1115" />
+    <title>桌面宠物 · 框架示例</title>
+    <style>
+      :root {
+        --bg: #0f1115;
+        --card: #171a21;
+        --line: #262b35;
+        --text: #e8ecf3;
+        --muted: #8b93a1;
+        --accent: #3d7bfd;
+      }
+      * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+      html, body {
+        margin: 0; height: 100%;
+        background: var(--bg); color: var(--text);
+        font-family: system-ui, -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+      }
+      main { max-width: 560px; margin: 0 auto; padding: 22px 16px 40px; }
+      h1 { font-size: 19px; margin: 6px 0 2px; }
+      .sub { color: var(--muted); font-size: 13px; margin-bottom: 20px; }
+      .card { background: var(--card); border: 1px solid var(--line); border-radius: 14px; margin-bottom: 14px; overflow: hidden; }
+      .row { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 14px 16px; border-bottom: 1px solid var(--line); }
+      .row:last-child { border-bottom: 0; }
+      .label { font-size: 15px; }
+      .hint { color: var(--muted); font-size: 12px; margin-top: 3px; }
+      button {
+        font: inherit; color: var(--text); background: #232936;
+        border: 1px solid var(--line); border-radius: 10px; padding: 9px 14px;
+      }
+      button.primary { background: var(--accent); border-color: var(--accent); }
+      button:disabled { opacity: 0.45; }
+      .seg { display: flex; gap: 8px; }
+      .seg button { padding: 8px 14px; }
+      .seg button.on { background: var(--accent); border-color: var(--accent); }
+      .switch { position: relative; width: 48px; height: 28px; }
+      .switch input { opacity: 0; width: 0; height: 0; }
+      .switch span {
+        position: absolute; inset: 0; background: #2b3240; border-radius: 99px; transition: 0.18s;
+      }
+      .switch span::after {
+        content: ""; position: absolute; left: 3px; top: 3px; width: 22px; height: 22px;
+        background: #fff; border-radius: 50%; transition: 0.18s;
+      }
+      .switch input:checked + span { background: var(--accent); }
+      .switch input:checked + span::after { transform: translateX(20px); }
+      .actions { display: flex; flex-wrap: wrap; gap: 8px; padding: 14px 16px; }
+      .status { color: var(--muted); font-size: 12px; padding: 0 4px 10px; min-height: 16px; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>桌面宠物 · 框架示例</h1>
+      <div class="sub">overlay + 透明视频 + TTS + 动作标签的最小演示</div>
+
+      <div class="card">
+        <div class="row">
+          <div>
+            <div class="label">悬浮窗</div>
+            <div class="hint" id="hintOverlay">需要「显示在其他应用上层」权限</div>
+          </div>
+          <button id="btnStart" class="primary">开启</button>
+        </div>
+        <div class="row">
+          <div>
+            <div class="label">大小</div>
+            <div class="hint">单位 dp，窗口高度为宽度的 0.8 倍</div>
+          </div>
+          <div class="seg" id="segSize">
+            <button data-size="180">小</button>
+            <button data-size="220" class="on">中</button>
+            <button data-size="260">大</button>
+          </div>
+        </div>
+        <div class="row">
+          <div>
+            <div class="label">锁定</div>
+            <div class="hint">锁住后触摸穿透，桌面怎么划都不受影响</div>
+          </div>
+          <label class="switch"><input type="checkbox" id="switchLock" /><span></span></label>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="row">
+          <div>
+            <div class="label">语音</div>
+            <div class="hint" id="hintTts">使用系统 TTS 引擎</div>
+          </div>
+          <button id="btnSpeak">试听</button>
+        </div>
+        <div class="actions">
+          <button data-action="跳">跳</button>
+          <button data-action="笑">笑</button>
+          <button data-action="生气">生气</button>
+          <button data-action="撒娇">撒娇</button>
+          <button data-action="委屈">委屈</button>
+        </div>
+        <div class="status" id="status"></div>
+      </div>
+    </main>
+
+    <script>
+      var B = window.FloatingPet || null;
+      var state = { running: false, size: 220, locked: false };
+
+      function $(id) { return document.getElementById(id); }
+      function tip(text) { $('status').textContent = text || ''; }
+
+      function refresh() {
+        if (!B) {
+          tip('没有检测到原生桥：这个页面需要打进 APK 里运行');
+          return;
+        }
+        state.running = !!B.isRunning();
+        $('btnStart').textContent = state.running ? '关闭' : '开启';
+        var can = !!B.canDrawOverlays();
+        $('hintOverlay').textContent = can ? '已授权，可以开启' : '需要「显示在其他应用上层」权限';
+        $('btnStart').disabled = !can && !state.running;
+        try {
+          var s = JSON.parse(B.getPetSettings() || '{}');
+          if (s.size) state.size = s.size;
+          state.locked = !!s.locked;
+        } catch (error) { /* ignore */ }
+        $('switchLock').checked = state.locked;
+        var seg = $('segSize').querySelectorAll('button');
+        for (var i = 0; i < seg.length; i += 1) {
+          seg[i].classList.toggle('on', Number(seg[i].dataset.size) === state.size);
+        }
+        try {
+          var tts = JSON.parse(B.getTtsStatus() || '{}');
+          $('hintTts').textContent = '引擎：' + (tts.engine || '系统默认');
+        } catch (error) { /* ignore */ }
+      }
+
+      $('btnStart').addEventListener('click', function () {
+        if (!B) return;
+        if (!B.canDrawOverlays()) {
+          B.requestOverlayPermission();
+          return;
+        }
+        if (state.running) B.stop();
+        else B.start();
+        setTimeout(refresh, 400);
+      });
+
+      $('segSize').addEventListener('click', function (event) {
+        var btn = event.target.closest('button');
+        if (!btn || !B) return;
+        state.size = Number(btn.dataset.size);
+        B.setPetSize(state.size);
+        refresh();
+      });
+
+      $('switchLock').addEventListener('change', function () {
+        if (!B) return;
+        B.setLocked(this.checked);
+        refresh();
+      });
+
+      $('btnSpeak').addEventListener('click', function () {
+        if (!B) return;
+        B.speak('你好呀，这是占位角色的声音测试。');
+      });
+
+      document.querySelectorAll('[data-action]').forEach(function (button) {
+        button.addEventListener('click', function () {
+          if (!B) return;
+          // 文字里可以带 [动作:x] 标签，服务会剥掉标签并让宠物做动作
+          B.speakWithAction('看，我会' + button.dataset.action + '。', button.dataset.action);
+        });
+      });
+
+      document.addEventListener('visibilitychange', function () {
+        if (!document.hidden) refresh();
+      });
+
+      refresh();
+    </script>
+  </body>
+</html>

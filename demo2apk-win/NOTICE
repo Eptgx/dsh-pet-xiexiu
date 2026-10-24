@@ -1,0 +1,22 @@
+NOTICE
+
+demo2apk-win —— demo2apk 的 Windows 本地化分支（非官方）。
+
+上游项目
+  https://github.com/DeadWaveWave/demo2apk
+  分叉起点：2.3.0
+
+上游许可
+  上游 README 声明为 MIT，但下载到的源码包中没有 LICENSE 文件。
+  本分支沿用同一许可，条文见同目录 LICENSE。
+
+本分支相对上游的主要改动
+  - 去掉 Docker 部署，改为 Windows 本机进程（API + Worker + Web）。
+  - 增加 Windows 下 Android SDK / JDK 路径探测。
+  - Gradle 固定 8.14，处理 gradlew.bat / gradle.bat 的调用差异。
+  - 用 adm-zip 与 fetch 替代系统 zip / unzip / curl。
+  - 修复 Android 状态栏、导航栏与窗口背景（含 Capacitor 分支）。
+  - 本地使用时默认关闭打包限流。
+  - 新增 Windows 部署、构建流程、新机器配置等中文文档。
+
+本分支为非官方分支，与上游作者无隶属关系。

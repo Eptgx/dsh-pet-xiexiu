@@ -1,0 +1,1309 @@
+import fs from 'fs-extra';
+import path from 'path';
+import { homedir } from 'os';
+import { fileURLToPath } from 'url';
+import { execa, execaCommand } from 'execa';
+import sharp from 'sharp';
+import { pinyin } from 'pinyin-pro';
+import { detectAndroidSdk, setupAndroidEnv } from '../utils/android-sdk.js';
+import { fixExpoProject } from '../utils/expo-project-fixer.js';
+import { fixViteProject, needsViteProjectFix } from '../utils/react-project-fixer.js';
+import { runUnzip } from '../utils/unzip.js';
+import { generateAppId, ensureGradleWrapper } from './html-builder.js';
+import { shouldCleanupBuildArtifacts } from '../utils/build-env.js';
+import { getFullPermissionName, validatePermissions } from '../utils/android-permissions.js';
+import { exportDirAsPwaSite, type PwaExportResult } from '../utils/pwa.js';
+import { injectDemo2apkRuntimeScriptTag, writeDemo2apkRuntimeScript } from '../utils/webview-compat.js';
+import { applyAndroidSystemBarTheme, extractThemeColor, isLightColor, DEFAULT_SYSTEM_BAR_COLOR } from '../utils/android-theme.js';
+import { setAndroidTargetSdk, ANDROID_TARGET_SDK } from '../utils/android-gradle.js';
+
+/**
+ * Calculate optimal Node.js memory limit based on container memory.
+ * Reads from CONTAINER_MEMORY_MB environment variable (set in docker-compose).
+ * 
+ * Strategy:
+ * - Reserve 512MB for system, Gradle daemon, and other processes
+ * - Use 60% of remaining memory for Node.js
+ * - Cap at 4GB, floor at 512MB
+ */
+function calculateNodeMemoryLimit(): number {
+  const containerMemMB = parseInt(process.env.CONTAINER_MEMORY_MB || '2048', 10);
+  const reservedMB = 512; // For system + Gradle
+  const availableMB = Math.max(0, containerMemMB - reservedMB);
+
+  // Use 60% of available memory, capped between 512MB and 4GB
+  const targetMB = Math.floor(availableMB * 0.6);
+  const limitMB = Math.max(512, Math.min(4096, targetMB));
+
+  return limitMB;
+}
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+/**
+ * Sanitize a string to be safe for use as a directory name.
+ * - Convert non-ASCII (e.g., Chinese) to pinyin (same strategy as generateAppId)
+ * - Then strip to ASCII letters/numbers with dashes for readability
+ * This prevents Java/Gradle path encoding issues inside containers.
+ */
+function sanitizeDirName(name: string): string {
+  // Step 1: convert non-ASCII characters to pinyin, preserving rough pronunciation
+  let latinName = name;
+  try {
+    const py = pinyin(name, { toneType: 'none', type: 'array', nonZh: 'consecutive' });
+    latinName = Array.isArray(py) ? py.join('') : String(py);
+  } catch {
+    latinName = name;
+  }
+
+  // Step 2: keep only [a-z0-9] and collapse other runs into single dashes
+  let sanitized = latinName
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')   // Replace non-alnum with '-'
+    .replace(/-+/g, '-')           // Collapse multiple dashes
+    .replace(/^-|-$/g, '');        // Trim leading/trailing dashes
+
+  return sanitized || 'project';
+}
+
+/**
+ * Get the path to the default icon asset
+ */
+function getDefaultIconPath(): string {
+  // In dist: dist/builders/react-builder.js -> assets/default-icon.png
+  // In src: src/builders/react-builder.ts -> assets/default-icon.png
+  return path.resolve(__dirname, '../../assets/default-icon.png');
+}
+
+/**
+ * Android mipmap icon sizes for different DPI densities
+ */
+const ANDROID_MIPMAP_SIZES: Record<string, number> = {
+  'mipmap-mdpi': 48,
+  'mipmap-hdpi': 72,
+  'mipmap-xhdpi': 96,
+  'mipmap-xxhdpi': 144,
+  'mipmap-xxxhdpi': 192,
+};
+
+/**
+ * Android adaptive icon foreground sizes (larger than launcher icons)
+ */
+const ANDROID_FOREGROUND_SIZES: Record<string, number> = {
+  'mipmap-mdpi': 108,
+  'mipmap-hdpi': 162,
+  'mipmap-xhdpi': 216,
+  'mipmap-xxhdpi': 324,
+  'mipmap-xxxhdpi': 432,
+};
+
+/**
+ * Resize icon to specified size using sharp
+ */
+async function resizeIcon(inputPath: string, outputPath: string, size: number): Promise<void> {
+  await sharp(inputPath)
+    .resize(size, size, {
+      fit: 'contain',
+      background: { r: 0, g: 0, b: 0, alpha: 0 },
+    })
+    .png({ compressionLevel: 9 })
+    .toFile(outputPath);
+}
+
+/**
+ * Inject icon into Capacitor Android project
+ * Uses custom icon if provided, otherwise falls back to default icon
+ */
+async function injectIconCapacitor(
+  androidDir: string,
+  customIconPath?: string,
+  onProgress?: (message: string, percent?: number) => void,
+  progressPercent?: number
+): Promise<void> {
+  // Determine which icon to use
+  let iconPath: string;
+
+  if (customIconPath && await fs.pathExists(customIconPath)) {
+    iconPath = customIconPath;
+    onProgress?.('Injecting custom app icon...', progressPercent);
+  } else {
+    iconPath = getDefaultIconPath();
+    if (!(await fs.pathExists(iconPath))) {
+      onProgress?.('No icon found, skipping icon injection', progressPercent);
+      return;
+    }
+    onProgress?.('Injecting default app icon...', progressPercent);
+  }
+
+  const resDir = path.join(androidDir, 'app', 'src', 'main', 'res');
+
+  // Remove adaptive icon config (mipmap-anydpi-v26) to prevent icon cropping
+  // Android adaptive icons crop ~18% from edges, which ruins non-centered icons
+  const anydpiDir = path.join(resDir, 'mipmap-anydpi-v26');
+  if (await fs.pathExists(anydpiDir)) {
+    await fs.remove(anydpiDir);
+  }
+
+  // Resize and copy icon to each mipmap directory
+  for (const [mipmapDir, size] of Object.entries(ANDROID_MIPMAP_SIZES)) {
+    const targetDir = path.join(resDir, mipmapDir);
+
+    if (await fs.pathExists(targetDir)) {
+      // Resize as both ic_launcher.png and ic_launcher_round.png
+      await resizeIcon(iconPath, path.join(targetDir, 'ic_launcher.png'), size);
+      await resizeIcon(iconPath, path.join(targetDir, 'ic_launcher_round.png'), size);
+    }
+  }
+}
+
+export interface ReactBuildOptions {
+  zipPath: string;
+  appName?: string;
+  appId?: string;
+  appVersion?: string;  // App version (e.g., "1.0.0")
+  outputDir?: string;
+  iconPath?: string;  // Custom icon path (optional)
+  taskId?: string;    // Task ID for unique file naming (prevents concurrent build conflicts)
+  permissions?: string[];  // Custom Android permissions (optional)
+  pwa?: { outputDir: string; siteId: string };
+  projectRoot?: string;  // Root directory inside ZIP (if nested)
+  onProgress?: (message: string, percent?: number) => void;
+}
+
+export interface BuildResult {
+  success: boolean;
+  apkPath?: string;
+  error?: string;
+  duration?: number;
+  pwa?: PwaExportResult;
+}
+
+type ProjectType = 'vite' | 'cra' | 'nextjs' | 'unknown';
+type PackageManager = 'npm' | 'yarn' | 'pnpm';
+
+/**
+ * Detect the project type from package.json and config files
+ */
+async function detectProjectType(projectDir: string): Promise<{
+  type: ProjectType;
+  buildDir: string;
+}> {
+  const hasFile = async (filename: string) =>
+    fs.pathExists(path.join(projectDir, filename));
+
+  if (await hasFile('vite.config.js') || await hasFile('vite.config.ts')) {
+    return { type: 'vite', buildDir: 'dist' };
+  }
+
+  if (await hasFile('next.config.js') || await hasFile('next.config.ts') || await hasFile('next.config.mjs')) {
+    return { type: 'nextjs', buildDir: 'out' };
+  }
+
+  // Check for CRA
+  const pkgPath = path.join(projectDir, 'package.json');
+  if (await fs.pathExists(pkgPath)) {
+    const pkg = await fs.readJson(pkgPath);
+    if (pkg.dependencies?.['react-scripts'] || pkg.devDependencies?.['react-scripts']) {
+      return { type: 'cra', buildDir: 'build' };
+    }
+  }
+
+  return { type: 'unknown', buildDir: 'dist' };
+}
+
+/**
+ * Detect package manager from lock files
+ */
+async function detectPackageManager(projectDir: string): Promise<PackageManager> {
+  const hasFile = async (filename: string) =>
+    fs.pathExists(path.join(projectDir, filename));
+
+  if (await hasFile('pnpm-lock.yaml')) {
+    try {
+      await execaCommand('pnpm --version');
+      return 'pnpm';
+    } catch {
+      // Fall through
+    }
+  }
+
+  if (await hasFile('yarn.lock')) {
+    try {
+      await execaCommand('yarn --version');
+      return 'yarn';
+    } catch {
+      // Fall through
+    }
+  }
+
+  return 'npm';
+}
+
+/**
+ * Recursively search for package.json in a directory tree (up to 3 levels deep)
+ */
+async function findPackageJsonRecursive(dir: string): Promise<string | undefined> {
+  // Check current directory first
+  const rootPkg = path.join(dir, 'package.json');
+  if (await fs.pathExists(rootPkg)) {
+    return rootPkg;
+  }
+
+  // Check one level deep
+  const entries = await fs.readdir(dir, { withFileTypes: true });
+  const subdirs = entries.filter(e => e.isDirectory() && !e.name.startsWith('.') && e.name !== 'node_modules');
+
+  for (const entry of subdirs) {
+    const subPkg = path.join(dir, entry.name, 'package.json');
+    if (await fs.pathExists(subPkg)) {
+      return subPkg;
+    }
+  }
+
+  // Check two levels deep (handles structures like project-root/app/package.json)
+  for (const entry of subdirs) {
+    const subDir = path.join(dir, entry.name);
+    const subEntries = await fs.readdir(subDir, { withFileTypes: true });
+    for (const subEntry of subEntries) {
+      if (subEntry.isDirectory() && !subEntry.name.startsWith('.') && subEntry.name !== 'node_modules') {
+        const deepPkg = path.join(subDir, subEntry.name, 'package.json');
+        if (await fs.pathExists(deepPkg)) {
+          return deepPkg;
+        }
+      }
+    }
+  }
+
+  return undefined;
+}
+
+/**
+ * Configure Next.js for static export
+ */
+async function configureNextjsExport(projectDir: string): Promise<void> {
+  const configPath = path.join(projectDir, 'next.config.js');
+
+  // Check if already configured
+  if (await fs.pathExists(configPath)) {
+    const content = await fs.readFile(configPath, 'utf8');
+    if (content.includes("output: 'export'") || content.includes('output: "export"')) {
+      return;
+    }
+  }
+
+  // Create or overwrite config for static export
+  const config = `/** @type {import('next').NextConfig} */
+const nextConfig = {
+  output: 'export',
+  distDir: 'out',
+  images: {
+    unoptimized: true,
+  },
+  trailingSlash: true,
+};
+
+module.exports = nextConfig;
+`;
+
+  await fs.writeFile(configPath, config, 'utf8');
+}
+
+/**
+ * Build APK from React project ZIP
+ */
+/**
+ * Create a progress heartbeat that sends periodic updates during long-running commands.
+ * This prevents the frontend from appearing stuck.
+ */
+function createProgressHeartbeat(
+  onProgress: ((message: string, percent?: number) => void) | undefined,
+  baseMessage: string,
+  startPercent: number,
+  endPercent: number,
+  intervalMs = 5000
+): { start: () => void; stop: () => void } {
+  let timer: NodeJS.Timeout | null = null;
+  let currentPercent = startPercent;
+  const increment = Math.max(1, Math.floor((endPercent - startPercent) / 10)); // Max 10 increments
+
+  return {
+    start: () => {
+      if (!onProgress) return;
+      timer = setInterval(() => {
+        if (currentPercent < endPercent - increment) {
+          currentPercent += increment;
+          onProgress(`${baseMessage} (in progress...)`, currentPercent);
+        }
+      }, intervalMs);
+    },
+    stop: () => {
+      if (timer) {
+        clearInterval(timer);
+        timer = null;
+      }
+    },
+  };
+}
+
+/**
+ * Patch app/build.gradle to avoid Kotlin stdlib duplicate-class errors.
+ * Some dependency trees pull in both kotlin-stdlib and the older
+ * kotlin-stdlib-jdk7/jdk8 artifacts, which causes :app:checkDebugDuplicateClasses
+ * to fail. We globally exclude the legacy JDK7/8 modules here.
+ */
+async function patchKotlinDuplicateClasses(
+  androidDir: string,
+  onProgress?: (message: string, percent?: number) => void,
+  progressPercent?: number
+): Promise<void> {
+  const appBuildGradle = path.join(androidDir, 'app', 'build.gradle');
+  if (!(await fs.pathExists(appBuildGradle))) {
+    return;
+  }
+
+  let content = await fs.readFile(appBuildGradle, 'utf8');
+
+  // Idempotency: only patch once
+  if (content.includes('Demo2APK_kotlin_dedup_marker')) {
+    return;
+  }
+
+  const patch = `
+
+// Added by Demo2APK_kotlin_dedup_marker to avoid Kotlin stdlib duplicate classes
+configurations.configureEach {
+    exclude group: "org.jetbrains.kotlin", module: "kotlin-stdlib-jdk7"
+    exclude group: "org.jetbrains.kotlin", module: "kotlin-stdlib-jdk8"
+}
+`;
+
+  content += patch;
+  await fs.writeFile(appBuildGradle, content, 'utf8');
+
+  onProgress?.('Adjusted Gradle config to avoid Kotlin stdlib duplicates', progressPercent);
+}
+
+async function injectDemo2apkRuntimeIntoWebDir(webDir: string): Promise<void> {
+  const indexPath = path.join(webDir, 'index.html');
+  if (await fs.pathExists(indexPath)) {
+    const html = await fs.readFile(indexPath, 'utf8');
+    const next = injectDemo2apkRuntimeScriptTag(html);
+    if (next !== html) {
+      await fs.writeFile(indexPath, next, 'utf8');
+    }
+  }
+
+  await writeDemo2apkRuntimeScript(webDir);
+}
+
+async function patchCapacitorMainActivityForBlobSave(
+  androidDir: string,
+  appId: string,
+  onProgress?: (message: string, percent?: number) => void,
+  progressPercent?: number,
+  systemBarColor?: string
+): Promise<void> {
+  const javaRoot = path.join(androidDir, 'app', 'src', 'main', 'java');
+  const expectedPath = path.join(javaRoot, ...appId.split('.'), 'MainActivity.java');
+
+  let mainActivityPath = expectedPath;
+  if (!(await fs.pathExists(mainActivityPath))) {
+    const stack: string[] = [javaRoot];
+    let found: string | undefined;
+    while (stack.length > 0) {
+      const dir = stack.pop()!;
+      const entries = await fs.readdir(dir, { withFileTypes: true });
+      for (const entry of entries) {
+        const full = path.join(dir, entry.name);
+        if (entry.isDirectory()) {
+          stack.push(full);
+        } else if (entry.isFile() && entry.name === 'MainActivity.java') {
+          found = full;
+          break;
+        }
+      }
+      if (found) break;
+    }
+    if (!found) return;
+    mainActivityPath = found;
+  }
+
+  const existing = await fs.readFile(mainActivityPath, 'utf8');
+  if (existing.includes('Demo2APK_blob_save_marker')) {
+    return;
+  }
+
+  const pkgMatch = existing.match(/^\s*package\s+([a-zA-Z0-9_.]+)\s*;/m);
+  const packageName = pkgMatch?.[1] || appId;
+
+  const barColor = systemBarColor ?? DEFAULT_SYSTEM_BAR_COLOR;
+  const barIsLight = isLightColor(barColor) ? 'true' : 'false';
+
+  const next = `package ${packageName};
+
+// Demo2APK_blob_save_marker: enable saving blob/data downloads via Android SAF
+
+import android.content.Intent;
+import android.net.Uri;
+import android.os.Bundle;
+import android.util.Base64;
+import android.webkit.JavascriptInterface;
+import android.webkit.WebView;
+
+import java.io.OutputStream;
+import java.nio.charset.StandardCharsets;
+
+import com.getcapacitor.BridgeActivity;
+
+public class MainActivity extends BridgeActivity {
+    private static final int DEMO2APK_CREATE_DOCUMENT_REQUEST = 54321;
+
+    private byte[] demo2apkPendingBytes = null;
+    private String demo2apkPendingMimeType = null;
+    private String demo2apkPendingFileName = null;
+
+    private boolean demo2apkEdgeToEdge = false;
+    private int demo2apkBarColor = android.graphics.Color.parseColor("${DEFAULT_SYSTEM_BAR_COLOR}");
+    private WebView demo2apkWebView = null;
+    private volatile int demo2apkInsetTop = 0;
+    private volatile int demo2apkInsetBottom = 0;
+
+    // Keeps the last few failures reachable from logcat and from the page, so an
+    // ignored exception cannot hide for long.
+    // logcat: adb logcat -s Demo2APK    page: window.Demo2APKSystemBar.getDiagnostics()
+    private static final java.util.List<String> DEMO2APK_DIAGNOSTICS = new java.util.ArrayList<String>();
+    private static final int DEMO2APK_DIAGNOSTICS_LIMIT = 10;
+
+    private static void Demo2APK_log(String step, Throwable error) {
+        try {
+            String message = step + ": " + (error == null ? "unknown error" : error.toString());
+            android.util.Log.w("Demo2APK", message, error);
+            synchronized (DEMO2APK_DIAGNOSTICS) {
+                DEMO2APK_DIAGNOSTICS.add(message);
+                while (DEMO2APK_DIAGNOSTICS.size() > DEMO2APK_DIAGNOSTICS_LIMIT) {
+                    DEMO2APK_DIAGNOSTICS.remove(0);
+                }
+            }
+        } catch (Throwable ignored) {
+            // Logging must never break the app.
+        }
+    }
+
+    @Override
+    public void onCreate(Bundle savedInstanceState) {
+        super.onCreate(savedInstanceState);
+
+        Demo2APK_applySystemBars();
+        Demo2APK_watchSafeArea();
+
+        try {
+            WebView webView = null;
+            try {
+                java.lang.reflect.Method getBridgeMethod = BridgeActivity.class.getMethod("getBridge");
+                Object bridgeObj = getBridgeMethod.invoke(this);
+                if (bridgeObj != null) {
+                    java.lang.reflect.Method getWebViewMethod = bridgeObj.getClass().getMethod("getWebView");
+                    Object webViewObj = getWebViewMethod.invoke(bridgeObj);
+                    if (webViewObj instanceof WebView) {
+                        webView = (WebView) webViewObj;
+                    }
+                }
+            } catch (Exception error) {
+                Demo2APK_log("onCreate:resolveWebView", error);
+            }
+
+            if (webView != null) {
+                webView.addJavascriptInterface(new Demo2APKBlobDownloader(), "Demo2APKBlobDownloader");
+                webView.addJavascriptInterface(new Demo2APKSystemBar(), "Demo2APKSystemBar");
+                demo2apkWebView = webView;
+                Demo2APK_setWebViewBackground(demo2apkBarColor);
+            }
+        } catch (Exception error) {
+            Demo2APK_log("onCreate:registerBridges", error);
+        }
+    }
+
+    // Lets the web app report the colour sitting behind the system bars, so the
+    // bars, their icons and the window background can follow in-app theme
+    // switches. window.Demo2APKSystemBar.setColor('#RRGGBB')
+    private class Demo2APKSystemBar {
+        // Real system bar sizes in CSS pixels, for pages whose
+        // env(safe-area-inset-*) resolves to 0 under Android WebView.
+        // window.Demo2APKSystemBar.getSafeAreaInsets() -> {"top":48,"bottom":16}
+        @JavascriptInterface
+        public String getSafeAreaInsets() {
+            try {
+                float density = getResources().getDisplayMetrics().density;
+                if (density <= 0f) density = 1f;
+
+                org.json.JSONObject json = new org.json.JSONObject();
+                json.put("top", Math.round(demo2apkInsetTop / density));
+                json.put("bottom", Math.round(demo2apkInsetBottom / density));
+                return json.toString();
+            } catch (Throwable error) {
+                Demo2APK_log("getSafeAreaInsets", error);
+                return null;
+            }
+        }
+
+        // Last few ignored failures, oldest first. The injected runtime script
+        // mirrors them into the page console, so the page shows its own errors.
+        // window.Demo2APKSystemBar.getDiagnostics()
+        @JavascriptInterface
+        public String getDiagnostics() {
+            try {
+                synchronized (DEMO2APK_DIAGNOSTICS) {
+                    org.json.JSONArray array = new org.json.JSONArray();
+                    for (String entry : DEMO2APK_DIAGNOSTICS) {
+                        array.put(entry);
+                    }
+                    return array.toString();
+                }
+            } catch (Throwable error) {
+                return null;
+            }
+        }
+
+        @JavascriptInterface
+        public void setColor(final String color) {
+            try {
+                final int parsed = android.graphics.Color.parseColor(color);
+                final boolean isLight = isLightSystemBarColor(parsed);
+                runOnUiThread(new Runnable() {
+                    @Override
+                    public void run() {
+                        demo2apkBarColor = parsed;
+                        Demo2APK_applySystemBarColor(parsed);
+                        Demo2APK_setWindowBackground(parsed);
+                        Demo2APK_setWebViewBackground(parsed);
+                        Demo2APK_setBarIconAppearance(isLight);
+                    }
+                });
+            } catch (Throwable error) {
+                Demo2APK_log("setColor(" + color + ")", error);
+            }
+        }
+    }
+
+    private static boolean isLightSystemBarColor(int color) {
+        double r = android.graphics.Color.red(color) / 255.0;
+        double g = android.graphics.Color.green(color) / 255.0;
+        double b = android.graphics.Color.blue(color) / 255.0;
+        double luminance = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+        return luminance > 0.5;
+    }
+
+    private class Demo2APKBlobDownloader {
+        @JavascriptInterface
+        public void saveBase64Data(String dataUrl, String fileName) {
+            ParsedData parsed = parseDataUrl(dataUrl);
+            if (parsed == null || parsed.bytes == null) {
+                return;
+            }
+
+            demo2apkPendingBytes = parsed.bytes;
+            demo2apkPendingMimeType = parsed.mimeType != null ? parsed.mimeType : "*/*";
+            demo2apkPendingFileName = sanitizeFileName(fileName, demo2apkPendingMimeType);
+
+            runOnUiThread(() -> {
+                try {
+                    Intent intent = new Intent(Intent.ACTION_CREATE_DOCUMENT);
+                    intent.addCategory(Intent.CATEGORY_OPENABLE);
+                    intent.setType(demo2apkPendingMimeType != null ? demo2apkPendingMimeType : "*/*");
+                    intent.putExtra(Intent.EXTRA_TITLE, demo2apkPendingFileName != null ? demo2apkPendingFileName : "download");
+                    startActivityForResult(intent, DEMO2APK_CREATE_DOCUMENT_REQUEST);
+                } catch (Exception error) {
+                    Demo2APK_log("saveBase64Data:createDocument", error);
+                }
+            });
+        }
+    }
+
+    // Android 15+ deprecated and now ignores statusBarColor / navigationBarColor.
+    // We prefer edge-to-edge: the system bars become transparent and the web
+    // content fills the space behind them, so the bars always show the page's own
+    // background colour and follow theme changes automatically. Devices where
+    // that is unavailable fall back to opaque bars painted the same colour.
+    private void Demo2APK_applySystemBars() {
+        try {
+            demo2apkBarColor = android.graphics.Color.parseColor("${barColor}");
+        } catch (Throwable error) {
+            Demo2APK_log("applySystemBars:parseColor(${barColor})", error);
+            demo2apkBarColor = android.graphics.Color.parseColor("${DEFAULT_SYSTEM_BAR_COLOR}");
+        }
+
+        try {
+            androidx.core.view.WindowCompat.setDecorFitsSystemWindows(getWindow(), false);
+            demo2apkEdgeToEdge = true;
+        } catch (Throwable error) {
+            // Older devices: keep the classic, opaque system bars instead.
+            Demo2APK_log("applySystemBars:setDecorFitsSystemWindows", error);
+            demo2apkEdgeToEdge = false;
+        }
+
+        Demo2APK_applySystemBarColor(demo2apkBarColor);
+        Demo2APK_setWindowBackground(demo2apkBarColor);
+        Demo2APK_setBarIconAppearance(${barIsLight});
+    }
+
+    private void Demo2APK_applySystemBarColor(int color) {
+        try {
+            if (demo2apkEdgeToEdge) {
+                getWindow().setStatusBarColor(android.graphics.Color.TRANSPARENT);
+                getWindow().setNavigationBarColor(android.graphics.Color.TRANSPARENT);
+            } else {
+                getWindow().setStatusBarColor(color);
+                getWindow().setNavigationBarColor(color);
+            }
+        } catch (Throwable error) {
+            Demo2APK_log("applySystemBarColor(edgeToEdge=" + demo2apkEdgeToEdge + ")", error);
+        }
+    }
+
+    // Covers the area behind the (transparent) system bars, so the page does not
+    // have to paint there for the bars to match the theme colour.
+    private void Demo2APK_setWindowBackground(int color) {
+        try {
+            getWindow().setBackgroundDrawable(new android.graphics.drawable.ColorDrawable(color));
+        } catch (Throwable error) {
+            Demo2APK_log("setWindowBackground", error);
+        }
+    }
+
+    private void Demo2APK_setWebViewBackground(int color) {
+        try {
+            if (demo2apkWebView != null) demo2apkWebView.setBackgroundColor(color);
+        } catch (Throwable error) {
+            Demo2APK_log("setWebViewBackground", error);
+        }
+    }
+
+    // Tracks the real system bar sizes so the page can reserve space for them.
+    // Android WebView derives env(safe-area-inset-*) from display cutouts only,
+    // which leaves them at 0 on most phones.
+    private void Demo2APK_watchSafeArea() {
+        try {
+            androidx.core.view.ViewCompat.setOnApplyWindowInsetsListener(
+                getWindow().getDecorView(),
+                new androidx.core.view.OnApplyWindowInsetsListener() {
+                    @Override
+                    public androidx.core.view.WindowInsetsCompat onApplyWindowInsets(
+                        android.view.View view, androidx.core.view.WindowInsetsCompat insets) {
+                        try {
+                            androidx.core.graphics.Insets bars = insets.getInsets(
+                                androidx.core.view.WindowInsetsCompat.Type.systemBars());
+                            demo2apkInsetTop = bars.top;
+                            demo2apkInsetBottom = bars.bottom;
+                        } catch (Throwable error) {
+                            Demo2APK_log("watchSafeArea:readInsets", error);
+                        }
+                        return insets;
+                    }
+                }
+            );
+        } catch (Throwable error) {
+            Demo2APK_log("watchSafeArea:setListener", error);
+        }
+    }
+
+    private void Demo2APK_setBarIconAppearance(boolean lightBars) {
+        try {
+            androidx.core.view.WindowInsetsControllerCompat controller =
+                androidx.core.view.WindowCompat.getInsetsController(getWindow(), getWindow().getDecorView());
+            controller.setAppearanceLightStatusBars(lightBars);
+            controller.setAppearanceLightNavigationBars(lightBars);
+        } catch (Throwable error) {
+            Demo2APK_log("setBarIconAppearance", error);
+        }
+    }
+
+    @Override
+    protected void onActivityResult(int requestCode, int resultCode, Intent data) {
+        if (requestCode == DEMO2APK_CREATE_DOCUMENT_REQUEST) {
+            if (resultCode == RESULT_OK && data != null && data.getData() != null && demo2apkPendingBytes != null) {
+                Uri uri = data.getData();
+                try (OutputStream out = getContentResolver().openOutputStream(uri)) {
+                    if (out != null) {
+                        out.write(demo2apkPendingBytes);
+                        out.flush();
+                    }
+                } catch (Exception error) {
+                    Demo2APK_log("onActivityResult:writeDownload", error);
+                }
+            }
+
+            demo2apkPendingBytes = null;
+            demo2apkPendingMimeType = null;
+            demo2apkPendingFileName = null;
+            return;
+        }
+
+        super.onActivityResult(requestCode, resultCode, data);
+    }
+
+    private static class ParsedData {
+        public final byte[] bytes;
+        public final String mimeType;
+
+        public ParsedData(byte[] bytes, String mimeType) {
+            this.bytes = bytes;
+            this.mimeType = mimeType;
+        }
+    }
+
+    private static ParsedData parseDataUrl(String dataUrl) {
+        if (dataUrl == null || !dataUrl.startsWith("data:")) return null;
+        int comma = dataUrl.indexOf(',');
+        if (comma == -1) return null;
+
+        String header = dataUrl.substring(5, comma);
+        String dataPart = dataUrl.substring(comma + 1);
+
+        String mimeType = "application/octet-stream";
+        if (header != null && !header.isEmpty()) {
+            String[] headerParts = header.split(";", 2);
+            if (headerParts.length > 0 && headerParts[0] != null && !headerParts[0].isEmpty()) {
+                mimeType = headerParts[0];
+            }
+        }
+
+        boolean base64 = header.contains(";base64");
+        try {
+            byte[] bytes;
+            if (base64) {
+                bytes = Base64.decode(dataPart, Base64.DEFAULT);
+            } else {
+                bytes = Uri.decode(dataPart).getBytes(StandardCharsets.UTF_8);
+            }
+            return new ParsedData(bytes, mimeType);
+        } catch (Exception error) {
+            Demo2APK_log("parseDataUrl", error);
+            return null;
+        }
+    }
+
+    private static String sanitizeFileName(String requested, String mimeType) {
+        String name = (requested == null || requested.trim().isEmpty()) ? "download" : requested.trim();
+        name = name.replaceAll("[\\\\\\\\/:*?\\\"<>|]", "_");
+
+        if (!name.contains(".")) {
+            String ext = extensionFromMime(mimeType);
+            if (!ext.isEmpty()) {
+                name = name + ext;
+            }
+        }
+
+        return name;
+    }
+
+    private static String extensionFromMime(String mimeType) {
+        if (mimeType == null) return "";
+        String m = mimeType.toLowerCase();
+        if (m.contains("json")) return ".json";
+        if (m.startsWith("text/")) return ".txt";
+        return "";
+    }
+}
+`;
+
+  await fs.writeFile(mainActivityPath, next, 'utf8');
+  onProgress?.('Patched Android MainActivity for blob/data export', progressPercent);
+}
+
+/**
+ * Inject Android permissions into Capacitor Android project
+ * This directly modifies the AndroidManifest.xml file
+ */
+async function injectPermissionsCapacitor(
+  androidDir: string,
+  permissions: string[],
+  onProgress?: (message: string, percent?: number) => void,
+  progressPercent?: number
+): Promise<void> {
+  if (!permissions || permissions.length === 0) {
+    return;
+  }
+
+  // Validate permissions
+  const { valid: validPermissions, invalid: invalidPermissions } = validatePermissions(permissions);
+
+  if (invalidPermissions.length > 0) {
+    onProgress?.(`Warning: Ignored invalid permissions: ${invalidPermissions.join(', ')}`, progressPercent);
+  }
+
+  if (validPermissions.length === 0) {
+    return;
+  }
+
+  onProgress?.(`Injecting ${validPermissions.length} custom permissions...`, progressPercent);
+
+  const manifestPath = path.join(androidDir, 'app', 'src', 'main', 'AndroidManifest.xml');
+  if (!(await fs.pathExists(manifestPath))) {
+    return;
+  }
+
+  let manifestContent = await fs.readFile(manifestPath, 'utf8');
+
+  // Check if already injected
+  if (manifestContent.includes('<!-- Demo2APK Custom Permissions -->')) {
+    return;
+  }
+
+  // Build permission XML elements
+  const permissionElements = validPermissions
+    .map(perm => {
+      const fullPerm = getFullPermissionName(perm);
+      // Check if this permission already exists
+      if (manifestContent.includes(`android:name="${fullPerm}"`)) {
+        return null; // Skip existing permissions
+      }
+      return `    <uses-permission android:name="${fullPerm}" />`;
+    })
+    .filter(Boolean)
+    .join('\n');
+
+  if (!permissionElements) {
+    return; // All permissions already exist
+  }
+
+  // Insert permissions after <manifest ...> opening tag
+  const permissionBlock = `\n    <!-- Demo2APK Custom Permissions -->\n${permissionElements}\n`;
+
+  // Find the position after the manifest opening tag
+  const manifestTagMatch = manifestContent.match(/<manifest[^>]*>/);
+  if (manifestTagMatch) {
+    const insertPos = manifestTagMatch.index! + manifestTagMatch[0].length;
+    manifestContent =
+      manifestContent.slice(0, insertPos) +
+      permissionBlock +
+      manifestContent.slice(insertPos);
+
+    await fs.writeFile(manifestPath, manifestContent);
+  }
+}
+
+export async function buildReactToApk(options: ReactBuildOptions): Promise<BuildResult> {
+  const startTime = Date.now();
+  const {
+    zipPath,
+    appName = 'MyReactApp',
+    // Default appId is derived from appName to avoid all React APKs sharing one package ID
+    appId = generateAppId(appName),
+    appVersion = '1.0.0',
+    outputDir = path.join(process.cwd(), 'builds'),
+    iconPath,
+    taskId,
+    permissions,
+    pwa,
+    onProgress,
+  } = options;
+
+  let pwaResult: PwaExportResult | undefined;
+
+  try {
+    // Validate ZIP file exists
+    if (!(await fs.pathExists(zipPath))) {
+      return { success: false, error: `ZIP file not found: ${zipPath}` };
+    }
+
+    onProgress?.('Checking build environment...', 5);
+
+    // Check Android SDK
+    const sdkInfo = await detectAndroidSdk();
+    if (!sdkInfo.isValid) {
+      return { success: false, error: 'Android SDK not found. Please set ANDROID_HOME.' };
+    }
+    setupAndroidEnv(sdkInfo.androidHome);
+
+    // Create work directory with ASCII-safe name to avoid Java/Gradle path encoding issues
+    const safeAppName = sanitizeDirName(appName);
+    const workDir = path.join(outputDir, `${safeAppName}-build`);
+    await fs.remove(workDir);
+    await fs.ensureDir(workDir);
+
+    onProgress?.('Extracting project...', 10);
+
+    // Extract ZIP
+    await runUnzip(['-q', zipPath, '-d', workDir]);
+
+    // Find project root (directory containing package.json)
+    let projectDir = workDir;
+    let packageJsonPath: string | undefined;
+
+    // If projectRoot is specified (from ZIP content detection), use it directly
+    if (options.projectRoot) {
+      const candidate = path.join(workDir, options.projectRoot);
+      const pkg = path.join(candidate, 'package.json');
+      if (await fs.pathExists(pkg)) {
+        projectDir = candidate;
+        packageJsonPath = pkg;
+      }
+    }
+
+    // Auto-discover package.json if not found via projectRoot
+    if (!packageJsonPath) {
+      packageJsonPath = await findPackageJsonRecursive(workDir);
+    }
+
+    if (!packageJsonPath) {
+      return { success: false, error: 'No package.json found in the ZIP archive' };
+    }
+
+    projectDir = path.dirname(packageJsonPath);
+
+    // Normalize project directory name to ASCII-safe to avoid Java/Gradle path
+    // encoding issues inside containers (non-UTF8 locales can break on Chinese paths).
+    const projectDirName = path.basename(projectDir);
+    const safeProjectDirName = sanitizeDirName(projectDirName);
+    if (safeProjectDirName !== projectDirName) {
+      const parentDir = path.dirname(projectDir);
+      const newProjectDir = path.join(parentDir, safeProjectDirName);
+
+      // If a previous run left a directory with the safe name, remove it first.
+      if (await fs.pathExists(newProjectDir)) {
+        await fs.remove(newProjectDir);
+      }
+
+      await fs.move(projectDir, newProjectDir);
+      projectDir = newProjectDir;
+      packageJsonPath = path.join(projectDir, 'package.json');
+    }
+
+    // Update package.json with app version
+    const packageJson = await fs.readJson(packageJsonPath);
+    packageJson.version = appVersion;
+    await fs.writeJson(packageJsonPath, packageJson, { spaces: 2 });
+
+    onProgress?.('Analyzing project...', 15);
+
+    // Detect project type and package manager
+    const { type: projectType, buildDir } = await detectProjectType(projectDir);
+    const packageManager = await detectPackageManager(projectDir);
+
+    onProgress?.(`Detected ${projectType} project, using ${packageManager}`, 18);
+
+    // Configure Next.js if needed
+    if (projectType === 'nextjs') {
+      onProgress?.('Configuring Next.js for static export...', 20);
+      await configureNextjsExport(projectDir);
+    }
+
+    // Fix/verify Vite project for APK compatibility (also handles missing index.css)
+    if (projectType === 'vite') {
+      const shouldFix = await needsViteProjectFix(projectDir);
+      onProgress?.(shouldFix
+        ? 'Fixing Vite config for APK compatibility...'
+        : 'Verifying Vite project setup (CSS, Tailwind, etc.)...', 22);
+      const fixResult = await fixViteProject(projectDir);
+      if (fixResult.fixed) {
+        onProgress?.(`Applied fixes: ${fixResult.changes.join(', ')}`, 24);
+      }
+    }
+
+    // Expo Router templates may default to `web.output: "server"` or `"static"`, which
+    // is not suitable for an offline APK WebView and can crash `expo export` in generic sandboxes.
+    const expoFix = await fixExpoProject(projectDir);
+    if (expoFix.fixed) {
+      onProgress?.(`Applied Expo fixes: ${expoFix.changes.join(', ')}`, 24);
+    }
+
+    // Remove any existing Capacitor config files to avoid TypeScript compilation errors
+    // (Capacitor will be installed later and we'll create our own config)
+    const existingCapConfig = path.join(projectDir, 'capacitor.config.ts');
+    const existingCapConfigJs = path.join(projectDir, 'capacitor.config.js');
+    if (await fs.pathExists(existingCapConfig)) {
+      await fs.remove(existingCapConfig);
+      onProgress?.('Removed existing capacitor.config.ts', 23);
+    }
+    if (await fs.pathExists(existingCapConfigJs)) {
+      await fs.remove(existingCapConfigJs);
+      onProgress?.('Removed existing capacitor.config.js', 23);
+    }
+
+    onProgress?.('Installing dependencies...', 25);
+
+    // Install dependencies (use --legacy-peer-deps for npm to handle version conflicts)
+    // Force NODE_ENV=development to ensure devDependencies (like vite) are installed
+    // even when the worker container runs with NODE_ENV=production
+    const installArgs = packageManager === 'npm'
+      ? ['install', '--legacy-peer-deps']
+      : ['install'];
+
+    // Auto-calculate Node.js memory limit based on available system/container memory
+    // Can be overridden via BUILD_NODE_MEMORY environment variable
+    const autoMemoryLimit = calculateNodeMemoryLimit();
+    const nodeMemoryLimit = process.env.BUILD_NODE_MEMORY || String(autoMemoryLimit);
+
+    const buildEnv: Record<string, string | undefined> = {
+      ...process.env,
+      NODE_ENV: 'development',
+      npm_config_production: 'false',
+      // Support custom npm registry mirror (e.g., https://registry.npmmirror.com)
+      ...(process.env.NPM_REGISTRY ? { npm_config_registry: process.env.NPM_REGISTRY } : {}),
+      // Limit Node.js heap memory to prevent OOM in memory-constrained environments
+      NODE_OPTIONS: `--max-old-space-size=${nodeMemoryLimit}`,
+    };
+
+    // Use heartbeat to show progress during long npm install
+    const installHeartbeat = createProgressHeartbeat(onProgress, 'Installing dependencies', 25, 38);
+    installHeartbeat.start();
+    try {
+      await execa(packageManager, installArgs, {
+        cwd: projectDir,
+        env: buildEnv,
+      });
+    } finally {
+      installHeartbeat.stop();
+    }
+
+    onProgress?.('Building React project...', 40);
+
+    // Build project (vite build will set NODE_ENV=production internally for optimization)
+    // Use heartbeat to show progress during long build
+    const buildHeartbeat = createProgressHeartbeat(onProgress, 'Building React project', 40, 53);
+    buildHeartbeat.start();
+    try {
+      // buildEnv already has NODE_OPTIONS with memory limit configured
+      await execa(packageManager, ['run', 'build'], {
+        cwd: projectDir,
+        env: buildEnv,
+      });
+    } finally {
+      buildHeartbeat.stop();
+    }
+
+    // Verify build output
+    const buildPath = path.join(projectDir, buildDir);
+    if (!(await fs.pathExists(buildPath))) {
+      return { success: false, error: `Build output directory not found: ${buildDir}` };
+    }
+
+    // Runtime compat: file input accept + blob/data download bridge (Android WebView)
+    await injectDemo2apkRuntimeIntoWebDir(buildPath);
+
+    if (pwa) {
+      const siteDir = path.join(pwa.outputDir, pwa.siteId);
+      onProgress?.('Exporting PWA site...', 54);
+      try {
+        await exportDirAsPwaSite(buildPath, siteDir, { appName, iconPath });
+        pwaResult = { siteId: pwa.siteId, siteDir, success: true };
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        pwaResult = { siteId: pwa.siteId, siteDir, success: false, error: message };
+        onProgress?.(`PWA export failed: ${message}`, 54);
+      }
+    }
+
+    onProgress?.('Installing Capacitor...', 55);
+
+    // Install Capacitor (use --legacy-peer-deps for npm)
+    const capacitorInstallArgs = packageManager === 'npm'
+      ? ['install', '--legacy-peer-deps', '@capacitor/core', '@capacitor/cli', '@capacitor/android']
+      : ['install', '@capacitor/core', '@capacitor/cli', '@capacitor/android'];
+
+    await execa(packageManager, capacitorInstallArgs, {
+      cwd: projectDir,
+      env: buildEnv,
+    });
+
+    onProgress?.('Configuring Capacitor...', 60);
+
+    // Create Capacitor config (use JSON.stringify to safely escape quotes/newlines)
+    const serializedAppId = JSON.stringify(appId);
+    const serializedAppName = JSON.stringify(appName);
+    const serializedBuildDir = JSON.stringify(buildDir);
+
+    const capacitorConfig = `import { CapacitorConfig } from '@capacitor/cli';
+
+const config: CapacitorConfig = {
+  appId: ${serializedAppId},
+  appName: ${serializedAppName},
+  webDir: ${serializedBuildDir},
+  bundledWebRuntime: false,
+  android: {
+    buildOptions: {
+      keystorePath: undefined,
+      keystoreAlias: undefined,
+    }
+  }
+};
+
+export default config;
+`;
+
+    await fs.writeFile(path.join(projectDir, 'capacitor.config.ts'), capacitorConfig, 'utf8');
+
+    onProgress?.('Adding Android platform...', 65);
+
+    // Add Android platform
+    // Some CLIs (including Capacitor) detect package manager via npm_config_user_agent,
+    // which can be inherited from the monorepo (e.g. pnpm). Force it to match the
+    // actual manager we used to install deps to avoid wrong Gradle paths.
+    const pkgAgent = packageManager === 'pnpm' ? 'pnpm' : (packageManager === 'yarn' ? 'yarn' : 'npm');
+    await execa('npx', ['cap', 'add', 'android'], {
+      cwd: projectDir,
+      env: { ...process.env, npm_config_user_agent: pkgAgent },
+    });
+
+    onProgress?.('Syncing web resources...', 70);
+
+    // Sync resources
+    await execa('npx', ['cap', 'sync', 'android'], {
+      cwd: projectDir,
+      env: { ...process.env, npm_config_user_agent: pkgAgent },
+    });
+
+    // Inject app icon (custom or default)
+    onProgress?.('Injecting app icon...', 75);
+    const androidDir = path.join(projectDir, 'android');
+    await injectIconCapacitor(androidDir, iconPath, onProgress, 75);
+
+    // Inject custom permissions (if any)
+    if (permissions && permissions.length > 0) {
+      onProgress?.('Configuring app permissions...', 76);
+      await injectPermissionsCapacitor(androidDir, permissions, onProgress, 76);
+    }
+
+    let capacitorIndexHtml = '';
+    try {
+      capacitorIndexHtml = await fs.readFile(path.join(buildPath, 'index.html'), 'utf8');
+    } catch {
+      // Entry HTML unreadable: fall back to the default system bar color.
+    }
+
+    const systemBarColor = extractThemeColor(capacitorIndexHtml) ?? DEFAULT_SYSTEM_BAR_COLOR;
+
+    await patchCapacitorMainActivityForBlobSave(androidDir, appId, onProgress, 77, systemBarColor);
+
+    await applyAndroidSystemBarTheme({
+      androidDir,
+      themeNames: ['AppTheme', 'AppTheme.NoActionBar', 'AppTheme.NoActionBarLaunch'],
+      color: systemBarColor,
+      onProgress,
+    });
+
+    if (await setAndroidTargetSdk(androidDir)) {
+      onProgress?.(`Set targetSdkVersion to ${ANDROID_TARGET_SDK} for classic system bars`);
+    }
+
+    // Ensure Gradle wrapper exists (script + wrapper JAR). Some templates may
+    // ship an incomplete wrapper, which would cause "GradleWrapperMain not found".
+    onProgress?.('Setting up Gradle...', 78);
+    await ensureGradleWrapper(androidDir, onProgress, 78);
+
+    // Avoid Kotlin stdlib duplicate-class errors by excluding legacy JDK7/8 artifacts.
+    await patchKotlinDuplicateClasses(androidDir, onProgress, 79);
+
+    // Guard against Capacitor generating a pnpm-style path while using npm/yarn.
+    // If the generated capacitor.settings.gradle points to a non-existent .pnpm path,
+    // but the standard node_modules path exists, rewrite it for a reliable build.
+    try {
+      const capSettings = path.join(projectDir, 'android', 'capacitor.settings.gradle');
+      if (await fs.pathExists(capSettings)) {
+        let content = await fs.readFile(capSettings, 'utf8');
+        const pnpmPathMatch = content.match(/project\(':capacitor-android'\)\.projectDir = new File\('(.*)'\)/);
+        const npmPath = "../node_modules/@capacitor/android/capacitor";
+        const npmAbsolute = path.join(projectDir, 'node_modules', '@capacitor', 'android', 'capacitor');
+        const pnpmPath = pnpmPathMatch?.[1] ?? '';
+        const pnpmAbsolute = path.resolve(path.join(projectDir, 'android', pnpmPath));
+        const npmExists = await fs.pathExists(npmAbsolute);
+        const pnpmExists = pnpmPath && await fs.pathExists(pnpmAbsolute);
+        if (!pnpmExists && npmExists && pnpmPath.includes('.pnpm')) {
+          content = content.replace(/project\(':capacitor-android'\)\.projectDir = new File\('(.*)'\)/, `project(':capacitor-android').projectDir = new File('${npmPath}')`);
+          await fs.writeFile(capSettings, content, 'utf8');
+        }
+      }
+    } catch {
+      // Non-fatal – continue with build
+    }
+
+    onProgress?.('Building APK (this may take a few minutes)...', 80);
+
+    // Build APK with memory-optimized settings
+    // Ensure gradlew is executable (Unix only — no-op on Windows)
+    if (process.platform !== 'win32') {
+      await fs.chmod(path.join(androidDir, 'gradlew'), 0o755);
+    }
+
+    // Use heartbeat to show progress during long Gradle build
+    const gradleHeartbeat = createProgressHeartbeat(onProgress, 'Building APK', 80, 93);
+    gradleHeartbeat.start();
+    try {
+      // Limit Gradle JVM heap to 1GB to prevent OOM in containers with 2GB limit
+      const GRADLE_VERSION = '8.14';
+      const gradleExe = process.platform === 'win32'
+        ? path.join(homedir(), '.gradle', 'gradle-dist', `gradle-${GRADLE_VERSION}`, 'bin', 'gradle.bat')
+        : './gradlew';
+      await execa(gradleExe, ['assembleDebug', '--no-daemon'], {
+        cwd: androidDir,
+        env: {
+          ...process.env,
+          // Limit Gradle daemon/forked process memory to prevent OOM
+          JAVA_HOME: process.env.JAVA_HOME || path.join(homedir(), '.jdks', 'jdk-21.0.11+10'),
+          GRADLE_OPTS: '-Xmx1024m -Dorg.gradle.jvmargs="-Xmx1024m -XX:+HeapDumpOnOutOfMemoryError"',
+        },
+      });
+    } finally {
+      gradleHeartbeat.stop();
+    }
+
+    onProgress?.('Exporting APK...', 95);
+
+    // Copy APK to output
+    const apkSource = path.join(
+      androidDir,
+      'app',
+      'build',
+      'outputs',
+      'apk',
+      'debug',
+      'app-debug.apk'
+    );
+
+    if (!(await fs.pathExists(apkSource))) {
+      return { success: false, error: 'APK build failed - output file not found' };
+    }
+
+    // Use taskId in filename to prevent concurrent build conflicts
+    // Format: appName--taskId.apk (e.g., "MyApp--abc123.apk")
+    const apkFileName = taskId ? `${appName}--${taskId}.apk` : `${appName}.apk`;
+    const apkDest = path.join(outputDir, apkFileName);
+    await fs.copy(apkSource, apkDest);
+
+    // Verify the APK file is valid and complete
+    const destStats = await fs.stat(apkDest);
+    const sourceStats = await fs.stat(apkSource);
+    if (destStats.size !== sourceStats.size) {
+      return { success: false, error: 'APK copy verification failed - file sizes do not match' };
+    }
+
+    // Optionally cleanup Capacitor work directory (build artifacts)
+    if (shouldCleanupBuildArtifacts()) {
+      try {
+        await fs.remove(workDir);
+      } catch {
+        // Non-fatal – ignore cleanup errors
+      }
+    }
+
+    const duration = Date.now() - startTime;
+
+    onProgress?.('Build completed!', 100);
+
+    return {
+      success: true,
+      apkPath: apkDest,
+      duration,
+      pwa: pwaResult,
+    };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    return {
+      success: false,
+      error: message,
+      duration: Date.now() - startTime,
+      pwa: pwaResult,
+    };
+  }
+}

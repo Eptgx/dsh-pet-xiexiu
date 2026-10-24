@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover"
+    />
+    <title>桌面宠物</title>
+    <link rel="stylesheet" href="pet.css" />
+  </head>
+  <body>
+    <div id="stage">
+      <div id="sprite">
+        <video id="vid0" class="vid" muted playsinline autoplay preload="auto"></video>
+        <video id="vid1" class="vid" muted playsinline autoplay preload="auto"></video>
+      </div>
+    </div>
+
+    <div id="dbg"></div>
+
+    <script src="pet/shared-core.js"></script>
+    <script src="pet/config.js"></script>
+    <script src="pet/bounds.js"></script>
+    <script src="pet.js"></script>
+  </body>
+</html>

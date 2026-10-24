@@ -1,0 +1,1202 @@
+import fs from 'fs-extra';
+import path from 'path';
+import os from 'os';
+import { fileURLToPath } from 'url';
+import { execa, execaCommand } from 'execa';
+import sharp from 'sharp';
+import { pinyin } from 'pinyin-pro';
+import { detectAndroidSdk, setupAndroidEnv, detectCordova } from '../utils/android-sdk.js';
+import { needsOfflineify, offlineifyHtml } from '../utils/offlineify.js';
+import { shouldCleanupBuildArtifacts } from '../utils/build-env.js';
+import { getFullPermissionName, DEFAULT_PERMISSIONS, validatePermissions } from '../utils/android-permissions.js';
+import { addPwaSupport, type PwaExportResult } from '../utils/pwa.js';
+import { runUnzip } from '../utils/unzip.js';
+import { injectDemo2apkRuntimeScriptTag, writeDemo2apkRuntimeScript } from '../utils/webview-compat.js';
+import { applyAndroidSystemBarTheme, extractThemeColor, DEFAULT_SYSTEM_BAR_COLOR } from '../utils/android-theme.js';
+import { setAndroidTargetSdk, ANDROID_TARGET_SDK } from '../utils/android-gradle.js';
+import { applyClassicSystemBars } from '../utils/android-system-bars.js';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+/**
+ * Get the path to the default icon asset
+ */
+function getDefaultIconPath(): string {
+  // In dist: dist/builders/html-builder.js -> assets/default-icon.png
+  // In src: src/builders/html-builder.ts -> assets/default-icon.png
+  return path.resolve(__dirname, '../../assets/default-icon.png');
+}
+
+export interface HtmlBuildOptions {
+  htmlPath: string;
+  appName?: string;
+  appId?: string;
+  appVersion?: string;  // App version (e.g., "1.0.0")
+  outputDir?: string;
+  skipOfflineify?: boolean;
+  iconPath?: string;  // Custom icon path (optional)
+  taskId?: string;    // Task ID for unique file naming
+  permissions?: string[];  // Custom Android permissions (optional)
+  pwa?: { outputDir: string; siteId: string };
+  onProgress?: (message: string, percent?: number) => void;
+}
+
+export interface HtmlProjectBuildOptions {
+  zipPath: string;
+  projectRoot?: string;  // Root directory inside ZIP (if nested)
+  appName?: string;
+  appId?: string;
+  appVersion?: string;  // App version (e.g., "1.0.0")
+  outputDir?: string;
+  iconPath?: string;
+  taskId?: string;
+  permissions?: string[];  // Custom Android permissions (optional)
+  pwa?: { outputDir: string; siteId: string };
+  onProgress?: (message: string, percent?: number) => void;
+}
+
+export interface BuildResult {
+  success: boolean;
+  apkPath?: string;
+  error?: string;
+  duration?: number;
+  pwa?: PwaExportResult;
+}
+
+const GRADLE_VERSION = '8.14';
+const GRADLE_DIST_URL = `https://mirrors.cloud.tencent.com/gradle/gradle-${GRADLE_VERSION}-bin.zip`;
+
+/**
+ * Android icon sizes for different DPI densities
+ */
+const ANDROID_ICON_SIZES: Record<string, number> = {
+  'ldpi': 36,
+  'mdpi': 48,
+  'hdpi': 72,
+  'xhdpi': 96,
+  'xxhdpi': 144,
+  'xxxhdpi': 192,
+};
+
+/**
+ * Resize icon to specified size using sharp
+ */
+async function resizeIcon(inputPath: string, outputPath: string, size: number): Promise<void> {
+  await sharp(inputPath)
+    .resize(size, size, {
+      fit: 'contain',
+      background: { r: 0, g: 0, b: 0, alpha: 0 },
+    })
+    .png({ compressionLevel: 9 })
+    .toFile(outputPath);
+}
+
+/**
+ * Inject icon into Cordova project
+ * Uses custom icon if provided, otherwise falls back to default icon
+ */
+async function injectIcon(
+  workDir: string,
+  customIconPath?: string,
+  onProgress?: (message: string, percent?: number) => void,
+  progressPercent?: number
+): Promise<void> {
+  // Determine which icon to use
+  let iconPath: string;
+
+  if (customIconPath && await fs.pathExists(customIconPath)) {
+    iconPath = customIconPath;
+    onProgress?.('Injecting custom app icon...', progressPercent);
+  } else {
+    iconPath = getDefaultIconPath();
+    if (!(await fs.pathExists(iconPath))) {
+      onProgress?.('No icon found, skipping icon injection', progressPercent);
+      return;
+    }
+    onProgress?.('Injecting default app icon...', progressPercent);
+  }
+
+  // Create res directory for icons
+  const resDir = path.join(workDir, 'res');
+  await fs.ensureDir(resDir);
+
+  // Create icon directory
+  const iconDir = path.join(resDir, 'icon/android');
+  await fs.ensureDir(iconDir);
+
+  // Resize and copy icon for each density
+  for (const [density, size] of Object.entries(ANDROID_ICON_SIZES)) {
+    const outputPath = path.join(iconDir, `icon-${density}.png`);
+    await resizeIcon(iconPath, outputPath, size);
+  }
+
+  // Also create the main icon (use xxxhdpi size = 192)
+  await resizeIcon(iconPath, path.join(resDir, 'icon.png'), 192);
+
+  // Update config.xml to include icon configuration
+  const configXmlPath = path.join(workDir, 'config.xml');
+  if (await fs.pathExists(configXmlPath)) {
+    let configContent = await fs.readFile(configXmlPath, 'utf8');
+
+    // Check if icon is already configured
+    if (!configContent.includes('<icon')) {
+      // Build icon configuration for Android
+      const iconConfigs = Object.entries(ANDROID_ICON_SIZES)
+        .map(([density, size]) =>
+          `    <icon density="${density}" src="res/icon/android/icon-${density}.png" width="${size}" height="${size}" />`
+        )
+        .join('\n');
+
+      const iconXml = `
+    <!-- App Icon -->
+    <icon src="res/icon.png" />
+    <platform name="android">
+${iconConfigs}
+    </platform>`;
+
+      // Insert icon config before closing </widget> tag
+      configContent = configContent.replace('</widget>', `${iconXml}\n</widget>`);
+      await fs.writeFile(configXmlPath, configContent);
+    }
+  }
+}
+
+/**
+ * Inject Android permissions into Cordova config.xml
+ * This adds custom permissions to the AndroidManifest.xml via config.xml
+ */
+async function injectPermissions(
+  workDir: string,
+  permissions: string[],
+  onProgress?: (message: string, percent?: number) => void,
+  progressPercent?: number
+): Promise<void> {
+  if (!permissions || permissions.length === 0) {
+    return;
+  }
+
+  // Validate permissions
+  const { valid: validPermissions, invalid: invalidPermissions } = validatePermissions(permissions);
+
+  if (invalidPermissions.length > 0) {
+    onProgress?.(`Warning: Ignored invalid permissions: ${invalidPermissions.join(', ')}`, progressPercent);
+  }
+
+  if (validPermissions.length === 0) {
+    return;
+  }
+
+  onProgress?.(`Injecting ${validPermissions.length} custom permissions...`, progressPercent);
+
+  const configXmlPath = path.join(workDir, 'config.xml');
+  if (!(await fs.pathExists(configXmlPath))) {
+    return;
+  }
+
+  let configContent = await fs.readFile(configXmlPath, 'utf8');
+
+  // Check if permissions are already configured
+  if (configContent.includes('<!-- Custom Permissions -->')) {
+    return;
+  }
+
+  // Build permission XML for Android platform
+  // Using edit-config to add uses-permission elements to AndroidManifest.xml
+  const permissionElements = validPermissions
+    .map(perm => {
+      const fullPerm = getFullPermissionName(perm);
+      return `            <uses-permission android:name="${fullPerm}" />`;
+    })
+    .join('\n');
+
+  // Check if there's already an Android platform section
+  const hasAndroidPlatform = configContent.includes('<platform name="android">');
+
+  if (hasAndroidPlatform) {
+    // Insert permissions config into existing Android platform section
+    const permissionConfig = `
+        <!-- Custom Permissions -->
+        <config-file parent="/manifest" target="AndroidManifest.xml" xmlns:android="http://schemas.android.com/apk/res/android">
+${permissionElements}
+        </config-file>`;
+
+    // Insert after <platform name="android">
+    configContent = configContent.replace(
+      /<platform name="android">/,
+      `<platform name="android">${permissionConfig}`
+    );
+  } else {
+    // Create new Android platform section with permissions
+    const platformSection = `
+    <platform name="android">
+        <!-- Custom Permissions -->
+        <config-file parent="/manifest" target="AndroidManifest.xml" xmlns:android="http://schemas.android.com/apk/res/android">
+${permissionElements}
+        </config-file>
+    </platform>`;
+
+    // Insert before closing </widget> tag
+    configContent = configContent.replace('</widget>', `${platformSection}\n</widget>`);
+  }
+
+  await fs.writeFile(configXmlPath, configContent);
+}
+
+/**
+ * Sanitize a string to be safe for use as a directory name.
+ * - Convert non-ASCII (e.g., Chinese) to pinyin (same strategy as generateAppId)
+ * - Then strip to ASCII letters/numbers with dashes for readability
+ * This prevents Java/Gradle path encoding issues inside containers.
+ */
+function sanitizeDirName(name: string): string {
+  // Step 1: convert non-ASCII characters to pinyin, preserving rough pronunciation
+  let latinName = name;
+  try {
+    const py = pinyin(name, { toneType: 'none', type: 'array', nonZh: 'consecutive' });
+    latinName = Array.isArray(py) ? py.join('') : String(py);
+  } catch {
+    latinName = name;
+  }
+
+  // Step 2: keep only [a-z0-9] and collapse other runs into single dashes
+  let sanitized = latinName
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')   // Replace non-alnum with '-'
+    .replace(/-+/g, '-')           // Collapse multiple dashes
+    .replace(/^-|-$/g, '');        // Trim leading/trailing dashes
+
+  return sanitized || 'project';
+}
+
+/**
+ * Generate a valid Android package ID from app name
+ * - Convert non-ASCII to pinyin
+ * - Remove all separators inside the suffix (no dots), only keep [a-z0-9]
+ * - Ensure starts with letter and apply max length
+ * - Prefix is always com.demo2apk.*
+ */
+export function generateAppId(appName: string): string {
+  const MAX_SUFFIX_LENGTH = 30;
+
+  // Step 1: convert non-ASCII (e.g., Chinese) to pinyin to keep uniqueness across languages
+  let latinName = appName;
+  try {
+    const py = pinyin(appName, { toneType: 'none', type: 'array', nonZh: 'consecutive' });
+    latinName = Array.isArray(py) ? py.join('') : String(py);
+  } catch {
+    // Fallback to original name if pinyin conversion fails
+    latinName = appName;
+  }
+
+  // Step 2: sanitize to Android-safe suffix (no dots inside the suffix)
+  let sanitized = latinName
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '');
+
+  if (!sanitized) {
+    sanitized = 'app';
+  }
+
+  // Ensure starts with a letter
+  if (!/^[a-z]/.test(sanitized)) {
+    sanitized = `a${sanitized}`;
+  }
+
+  // Apply max length to avoid overly long package names
+  sanitized = sanitized.slice(0, MAX_SUFFIX_LENGTH);
+
+  return `com.demo2apk.${sanitized}`;
+}
+
+/**
+ * Add required meta tags to HTML content for Cordova
+ */
+export function prepareHtmlForCordova(htmlContent: string): string {
+  let html = htmlContent;
+
+  // Add viewport meta if not present
+  if (!html.includes('viewport')) {
+    html = html.replace(
+      /<head([^>]*)>/i,
+      '<head$1>\n    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">'
+    );
+  }
+
+  // Add CSP meta if not present
+  if (!html.includes('Content-Security-Policy')) {
+    html = html.replace(
+      /<head([^>]*)>/i,
+      `<head$1>\n    <meta http-equiv="Content-Security-Policy" content="default-src * 'self' 'unsafe-inline' 'unsafe-eval' data: blob: filesystem: gap: content:">`
+    );
+  }
+
+  // Add cordova.js reference if not present
+  if (!html.includes('cordova.js')) {
+    html = html.replace('</body>', '    <script src="cordova.js"></script>\n</body>');
+  }
+
+  // Add demo2apk runtime fixes (file picker + blob/data download bridge)
+  html = injectDemo2apkRuntimeScriptTag(html);
+
+  return html;
+}
+
+async function patchCordovaAndroidMainActivityForBlobSave(
+  androidDir: string,
+  appId: string,
+  onProgress?: (message: string, percent?: number) => void,
+  progressPercent?: number
+): Promise<void> {
+  const javaRoot = path.join(androidDir, 'app', 'src', 'main', 'java');
+  const expectedPath = path.join(javaRoot, ...appId.split('.'), 'MainActivity.java');
+
+  let mainActivityPath = expectedPath;
+  if (!(await fs.pathExists(mainActivityPath))) {
+    // Fallback: locate MainActivity.java if package path differs
+    const stack: string[] = [javaRoot];
+    let found: string | undefined;
+    while (stack.length > 0) {
+      const dir = stack.pop()!;
+      const entries = await fs.readdir(dir, { withFileTypes: true });
+      for (const entry of entries) {
+        const full = path.join(dir, entry.name);
+        if (entry.isDirectory()) {
+          stack.push(full);
+        } else if (entry.isFile() && entry.name === 'MainActivity.java') {
+          found = full;
+          break;
+        }
+      }
+      if (found) break;
+    }
+    if (!found) return;
+    mainActivityPath = found;
+  }
+
+  const existing = await fs.readFile(mainActivityPath, 'utf8');
+  if (existing.includes('Demo2APK_blob_save_marker')) {
+    return;
+  }
+
+  const pkgMatch = existing.match(/^\s*package\s+([a-zA-Z0-9_.]+)\s*;/m);
+  const packageName = pkgMatch?.[1] || appId;
+
+  const next = `package ${packageName};
+
+// Demo2APK_blob_save_marker: enable saving blob/data downloads via Android SAF
+
+import android.content.Intent;
+import android.net.Uri;
+import android.os.Bundle;
+import android.util.Base64;
+import android.webkit.JavascriptInterface;
+import android.webkit.WebView;
+
+import java.io.OutputStream;
+import java.nio.charset.StandardCharsets;
+
+import org.apache.cordova.CordovaActivity;
+
+public class MainActivity extends CordovaActivity {
+    private static final int DEMO2APK_CREATE_DOCUMENT_REQUEST = 54321;
+
+    private byte[] demo2apkPendingBytes = null;
+    private String demo2apkPendingMimeType = null;
+    private String demo2apkPendingFileName = null;
+
+    @Override
+    public void onCreate(Bundle savedInstanceState) {
+        super.onCreate(savedInstanceState);
+        loadUrl(launchUrl);
+
+        try {
+            WebView webView = (WebView) appView.getView();
+            webView.addJavascriptInterface(new Demo2APKBlobDownloader(), "Demo2APKBlobDownloader");
+        } catch (Exception ignored) {
+            // Ignore: app still works without the bridge
+        }
+    }
+
+    private class Demo2APKBlobDownloader {
+        @JavascriptInterface
+        public void saveBase64Data(String dataUrl, String fileName) {
+            ParsedData parsed = parseDataUrl(dataUrl);
+            if (parsed == null || parsed.bytes == null) {
+                return;
+            }
+
+            demo2apkPendingBytes = parsed.bytes;
+            demo2apkPendingMimeType = parsed.mimeType != null ? parsed.mimeType : "*/*";
+            demo2apkPendingFileName = sanitizeFileName(fileName, demo2apkPendingMimeType);
+
+            runOnUiThread(() -> {
+                try {
+                    Intent intent = new Intent(Intent.ACTION_CREATE_DOCUMENT);
+                    intent.addCategory(Intent.CATEGORY_OPENABLE);
+                    intent.setType(demo2apkPendingMimeType != null ? demo2apkPendingMimeType : "*/*");
+                    intent.putExtra(Intent.EXTRA_TITLE, demo2apkPendingFileName != null ? demo2apkPendingFileName : "download");
+                    startActivityForResult(intent, DEMO2APK_CREATE_DOCUMENT_REQUEST);
+                } catch (Exception ignored) {
+                    // Ignore
+                }
+            });
+        }
+    }
+
+    @Override
+    protected void onActivityResult(int requestCode, int resultCode, Intent data) {
+        if (requestCode == DEMO2APK_CREATE_DOCUMENT_REQUEST) {
+            if (resultCode == RESULT_OK && data != null && data.getData() != null && demo2apkPendingBytes != null) {
+                Uri uri = data.getData();
+                try (OutputStream out = getContentResolver().openOutputStream(uri)) {
+                    if (out != null) {
+                        out.write(demo2apkPendingBytes);
+                        out.flush();
+                    }
+                } catch (Exception ignored) {
+                    // Ignore
+                }
+            }
+
+            demo2apkPendingBytes = null;
+            demo2apkPendingMimeType = null;
+            demo2apkPendingFileName = null;
+            return;
+        }
+
+        super.onActivityResult(requestCode, resultCode, data);
+    }
+
+    private static class ParsedData {
+        public final byte[] bytes;
+        public final String mimeType;
+
+        public ParsedData(byte[] bytes, String mimeType) {
+            this.bytes = bytes;
+            this.mimeType = mimeType;
+        }
+    }
+
+    private static ParsedData parseDataUrl(String dataUrl) {
+        if (dataUrl == null || !dataUrl.startsWith("data:")) return null;
+        int comma = dataUrl.indexOf(',');
+        if (comma == -1) return null;
+
+        String header = dataUrl.substring(5, comma);
+        String dataPart = dataUrl.substring(comma + 1);
+
+        String mimeType = "application/octet-stream";
+        if (header != null && !header.isEmpty()) {
+            String[] headerParts = header.split(";", 2);
+            if (headerParts.length > 0 && headerParts[0] != null && !headerParts[0].isEmpty()) {
+                mimeType = headerParts[0];
+            }
+        }
+
+        boolean base64 = header.contains(";base64");
+        try {
+            byte[] bytes;
+            if (base64) {
+                bytes = Base64.decode(dataPart, Base64.DEFAULT);
+            } else {
+                bytes = Uri.decode(dataPart).getBytes(StandardCharsets.UTF_8);
+            }
+            return new ParsedData(bytes, mimeType);
+        } catch (Exception ignored) {
+            return null;
+        }
+    }
+
+    private static String sanitizeFileName(String requested, String mimeType) {
+        String name = (requested == null || requested.trim().isEmpty()) ? "download" : requested.trim();
+        name = name.replaceAll("[\\\\\\\\/:*?\\\"<>|]", "_");
+
+        if (!name.contains(".")) {
+            String ext = extensionFromMime(mimeType);
+            if (!ext.isEmpty()) {
+                name = name + ext;
+            }
+        }
+
+        return name;
+    }
+
+    private static String extensionFromMime(String mimeType) {
+        if (mimeType == null) return "";
+        String m = mimeType.toLowerCase();
+        if (m.contains("json")) return ".json";
+        if (m.startsWith("text/")) return ".txt";
+        return "";
+    }
+}
+`;
+
+  await fs.writeFile(mainActivityPath, next, 'utf8');
+  onProgress?.('Patched Android MainActivity for blob/data export', progressPercent);
+}
+
+
+/**
+ * Download and setup Gradle wrapper
+ * Note: Gradle is cached in ~/.gradle/wrapper/dists (standard Gradle cache location)
+ * This ensures Docker volume mounting gradle-cache:/root/.gradle works correctly.
+ *
+ * Exported so React builder can reuse the same logic.
+ */
+export async function ensureGradleWrapper(
+  androidDir: string,
+  onProgress?: (message: string, percent?: number) => void,
+  progressPercent?: number
+): Promise<void> {
+  const gradlewPath = path.join(androidDir, 'gradlew');
+  const gradlewBatPath = path.join(androidDir, 'gradlew.bat');
+  const wrapperJarPath = path.join(androidDir, 'gradle', 'wrapper', 'gradle-wrapper.jar');
+
+  // On Windows, always copy the wrapper JAR from the distribution first to avoid issues
+  // with gradle wrapper command failing due to network or path encoding problems.
+  const gradleDist = path.join(os.homedir(), '.gradle', 'gradle-dist', `gradle-${GRADLE_VERSION}`);
+  const distWrapperJar = path.join(gradleDist, 'lib', 'plugins', `gradle-wrapper-main-${GRADLE_VERSION}.jar`);
+
+  if (process.platform === 'win32' && await fs.pathExists(distWrapperJar)) {
+    await fs.ensureDir(path.dirname(wrapperJarPath));
+    await fs.copyFile(distWrapperJar, wrapperJarPath);
+    onProgress?.('gradle-wrapper.jar ready', progressPercent);
+  }
+
+  // Also ensure gradlew.bat exists for the wrapper to work
+  const hasGradlew = await fs.pathExists(gradlewPath) || await fs.pathExists(gradlewBatPath);
+  if (hasGradlew && await fs.pathExists(wrapperJarPath)) {
+    return;
+  }
+
+  // Only reach here if wrapper script or JAR is still missing
+  onProgress?.('Setting up Gradle build tools...', progressPercent);
+
+  // Download Gradle distribution if not cached locally
+  if (!(await fs.pathExists(gradleDist))) {
+    onProgress?.(`Downloading Gradle ${GRADLE_VERSION}...`);
+    const tmpZip = path.join(os.tmpdir(), `gradle-${GRADLE_VERSION}.zip`);
+    const response = await fetch(GRADLE_DIST_URL);
+    if (!response.ok) {
+      throw new Error(`Failed to download Gradle: ${response.status} ${response.statusText}`);
+    }
+    const buffer = Buffer.from(await response.arrayBuffer());
+    await fs.writeFile(tmpZip, buffer);
+    await fs.ensureDir(path.dirname(gradleDist));
+    await runUnzip(['-q', tmpZip, '-d', path.dirname(gradleDist)]);
+    await fs.remove(tmpZip);
+  }
+
+  // Ensure the wrapper JAR is in place (from the downloaded distribution)
+  if (!(await fs.pathExists(wrapperJarPath)) && await fs.pathExists(distWrapperJar)) {
+    await fs.ensureDir(path.dirname(wrapperJarPath));
+    await fs.copyFile(distWrapperJar, wrapperJarPath);
+    onProgress?.('gradle-wrapper.jar created', progressPercent);
+  }
+
+  // Ensure gradlew is executable (Unix only — no-op on Windows)
+  if (process.platform !== 'win32') {
+    await fs.chmod(gradlewPath, 0o755);
+  }
+}
+
+/**
+ * Build APK from HTML file using Cordova
+ */
+export async function buildHtmlToApk(options: HtmlBuildOptions): Promise<BuildResult> {
+  const startTime = Date.now();
+  const {
+    htmlPath,
+    appName = 'MyVibeApp',
+    appId = generateAppId(appName),
+    appVersion = '1.0.0',
+    outputDir = path.join(process.cwd(), 'builds'),
+    skipOfflineify = false,
+    iconPath,
+    permissions,
+    pwa,
+    onProgress,
+  } = options;
+
+  let pwaResult: PwaExportResult | undefined;
+
+  try {
+    // Validate HTML file exists
+    if (!(await fs.pathExists(htmlPath))) {
+      return { success: false, error: `HTML file not found: ${htmlPath}` };
+    }
+
+    onProgress?.('Checking build environment...', 5);
+
+    // Check Android SDK
+    const sdkInfo = await detectAndroidSdk();
+    if (!sdkInfo.isValid) {
+      return { success: false, error: 'Android SDK not found. Please set ANDROID_HOME.' };
+    }
+    setupAndroidEnv(sdkInfo.androidHome);
+
+    // Check Cordova
+    const cordovaInfo = await detectCordova();
+    if (!cordovaInfo.isInstalled) {
+      onProgress?.('Installing Cordova CLI...', 10);
+      await execaCommand('npm install -g cordova');
+    }
+
+    // Prepare HTML (offlineify if needed)
+    let processedHtmlPath = htmlPath;
+    let tempOfflineDir: string | undefined;
+
+    const htmlContent = await fs.readFile(htmlPath, 'utf8');
+
+    if (!skipOfflineify && needsOfflineify(htmlContent)) {
+      onProgress?.('Offlineifying HTML resources...', 15);
+      const result = await offlineifyHtml({ inputPath: htmlPath });
+      processedHtmlPath = result.indexPath;
+      tempOfflineDir = result.outputDir;
+    }
+
+    // Create work directory with ASCII-safe name to avoid Java/Gradle path encoding issues
+    const safeAppName = sanitizeDirName(appName);
+    const workDir = path.join(outputDir, safeAppName);
+    await fs.remove(workDir);
+    await fs.ensureDir(workDir);
+
+    onProgress?.('Creating Cordova project...', 25);
+
+    // Create Cordova project
+    await execa('cordova', ['create', '.', appId, appName, '--no-telemetry'], {
+      cwd: workDir,
+    });
+
+    onProgress?.('Installing cordova-android...', 32);
+
+    // Pre-install cordova-android using pnpm (npm has issues with cordova projects)
+    // Use --ignore-workspace to avoid conflicts with root workspace
+    await execa('pnpm', ['add', 'cordova-android@14', '-D', '--ignore-workspace'], {
+      cwd: workDir,
+      timeout: 120000, // 2 minute timeout
+    });
+
+    onProgress?.('Adding Android platform...', 38);
+
+    // Add Android platform
+    await execa('cordova', ['platform', 'add', 'android', '--no-telemetry'], {
+      cwd: workDir,
+      timeout: 60000,
+    });
+
+    // Inject app icon (custom or default)
+    onProgress?.('Injecting app icon...', 42);
+    await injectIcon(workDir, iconPath, onProgress, 42);
+
+    // Inject custom permissions (if any)
+    if (permissions && permissions.length > 0) {
+      onProgress?.('Configuring app permissions...', 43);
+      await injectPermissions(workDir, permissions, onProgress, 43);
+    }
+
+    // Update config.xml with app version
+    onProgress?.('Setting app version...', 44);
+    const configXmlPath = path.join(workDir, 'config.xml');
+    if (await fs.pathExists(configXmlPath)) {
+      let configContent = await fs.readFile(configXmlPath, 'utf8');
+      // Update version attribute in widget tag
+      configContent = configContent.replace(
+        /(<widget[^>]*version=")[^"]*(")/,
+        `$1${appVersion}$2`
+      );
+      // If version attribute doesn't exist, add it
+      if (!configContent.includes('version="')) {
+        configContent = configContent.replace(
+          /(<widget[^>]*)(>)/,
+          `$1 version="${appVersion}"$2`
+        );
+      }
+      await fs.writeFile(configXmlPath, configContent);
+    }
+
+    onProgress?.('Preparing web resources...', 45);
+
+    if (pwa) {
+      const siteDir = path.join(pwa.outputDir, pwa.siteId);
+      onProgress?.('Exporting PWA site...', 44);
+      try {
+        await fs.remove(siteDir);
+        await fs.ensureDir(siteDir);
+        const htmlDir = path.dirname(tempOfflineDir ? path.join(tempOfflineDir, 'index.html') : processedHtmlPath);
+        await fs.copy(htmlDir, siteDir);
+        const htmlBasename = path.basename(processedHtmlPath);
+        if (htmlBasename !== 'index.html') {
+          const srcPath = path.join(siteDir, htmlBasename);
+          const destPath = path.join(siteDir, 'index.html');
+          if (await fs.pathExists(srcPath)) {
+            await fs.move(srcPath, destPath, { overwrite: true });
+          }
+        }
+        await addPwaSupport(siteDir, { appName, iconPath });
+        pwaResult = { siteId: pwa.siteId, siteDir, success: true };
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        pwaResult = { siteId: pwa.siteId, siteDir, success: false, error: message };
+        onProgress?.(`PWA export failed: ${message}`, 44);
+      }
+    }
+
+    // Clear www directory and copy HTML resources
+    const wwwDir = path.join(workDir, 'www');
+    await fs.emptyDir(wwwDir);
+
+    // Copy all files from HTML directory
+    const htmlDir = path.dirname(tempOfflineDir ? path.join(tempOfflineDir, 'index.html') : processedHtmlPath);
+    await fs.copy(htmlDir, wwwDir);
+
+    // Rename to index.html if needed
+    const htmlBasename = path.basename(processedHtmlPath);
+    if (htmlBasename !== 'index.html') {
+      const srcPath = path.join(wwwDir, htmlBasename);
+      const destPath = path.join(wwwDir, 'index.html');
+      if (await fs.pathExists(srcPath)) {
+        await fs.move(srcPath, destPath, { overwrite: true });
+      }
+    }
+
+    // Process HTML for Cordova
+    const indexPath = path.join(wwwDir, 'index.html');
+    let finalHtml = await fs.readFile(indexPath, 'utf8');
+    finalHtml = prepareHtmlForCordova(finalHtml);
+    await fs.writeFile(indexPath, finalHtml);
+    await writeDemo2apkRuntimeScript(wwwDir);
+
+    onProgress?.('Syncing resources to Android platform...', 55);
+
+    // Prepare Android platform
+    await execa('cordova', ['prepare', 'android', '--no-telemetry'], {
+      cwd: workDir,
+    });
+
+    await patchCordovaAndroidMainActivityForBlobSave(path.join(workDir, 'platforms', 'android'), appId, onProgress, 58);
+
+    await applyAndroidSystemBarTheme({
+      androidDir: path.join(workDir, 'platforms', 'android'),
+      themeNames: ['AppTheme'],
+      color: extractThemeColor(finalHtml) ?? DEFAULT_SYSTEM_BAR_COLOR,
+      onProgress,
+    });
+
+    // 必须在主题之后：主题写透明栏，这里覆盖成不透明，否则状态栏纯黑
+    await applyClassicSystemBars({
+      androidDir: path.join(workDir, 'platforms', 'android'),
+      appId,
+      onProgress,
+    });
+
+    if (await setAndroidTargetSdk(path.join(workDir, 'platforms', 'android'))) {
+      onProgress?.(`Set targetSdkVersion to ${ANDROID_TARGET_SDK} for classic system bars`);
+    }
+
+    onProgress?.('Setting up Gradle...', 60);
+
+    // Setup Gradle wrapper
+    const androidDir = path.join(workDir, 'platforms', 'android');
+    await ensureGradleWrapper(androidDir, onProgress, 60);
+
+    onProgress?.('Building APK (this may take a few minutes)...', 70);
+
+    // Build APK with memory-optimized settings
+    // Limit Gradle JVM heap to 1GB to prevent OOM in containers with 2GB limit
+    // Using --no-daemon is already set, but we also limit memory for the forked process
+    const gradleExe = process.platform === 'win32'
+      ? path.join(os.homedir(), '.gradle', 'gradle-dist', `gradle-${GRADLE_VERSION}`, 'bin', 'gradle.bat')
+      : './gradlew';
+    await execa(gradleExe, ['assembleDebug', '--no-daemon'], {
+      cwd: androidDir,
+      env: {
+        ...process.env,
+        // Limit Gradle daemon/forked process memory to prevent OOM
+        JAVA_HOME: process.env.JAVA_HOME || path.join(os.homedir(), '.jdks', 'jdk-21.0.11+10'),
+        GRADLE_OPTS: '-Xmx1024m -Dorg.gradle.jvmargs="-Xmx1024m -XX:+HeapDumpOnOutOfMemoryError"',
+      },
+    });
+
+    onProgress?.('Exporting APK...', 95);
+
+    // Copy APK to output
+    const apkSource = path.join(
+      androidDir,
+      'app',
+      'build',
+      'outputs',
+      'apk',
+      'debug',
+      'app-debug.apk'
+    );
+
+    if (!(await fs.pathExists(apkSource))) {
+      return { success: false, error: 'APK build failed - output file not found' };
+    }
+
+    // Use taskId in filename to prevent concurrent build conflicts
+    const apkFileName = options.taskId ? `${appName}--${options.taskId}.apk` : `${appName}.apk`;
+    const apkDest = path.join(outputDir, apkFileName);
+    await fs.copy(apkSource, apkDest);
+
+    // Cleanup temp directory
+    if (tempOfflineDir) {
+      await fs.remove(tempOfflineDir);
+    }
+
+    // Optionally cleanup Cordova work directory (build artifacts)
+    if (shouldCleanupBuildArtifacts()) {
+      try {
+        await fs.remove(workDir);
+      } catch {
+        // Non-fatal – ignore cleanup errors
+      }
+    }
+
+    const duration = Date.now() - startTime;
+
+    onProgress?.('Build completed!', 100);
+
+    return {
+      success: true,
+      apkPath: apkDest,
+      duration,
+      pwa: pwaResult,
+    };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    return {
+      success: false,
+      error: message,
+      duration: Date.now() - startTime,
+      pwa: pwaResult,
+    };
+  }
+}
+
+/**
+ * Build APK from multi-file HTML project ZIP (HTML + JS + CSS)
+ * Uses Cordova, no npm build step needed
+ */
+export async function buildHtmlProjectToApk(options: HtmlProjectBuildOptions): Promise<BuildResult> {
+  const startTime = Date.now();
+  const {
+    zipPath,
+    projectRoot = '',
+    appName = 'MyVibeApp',
+    appId = generateAppId(appName),
+    appVersion = '1.0.0',
+    outputDir = path.join(process.cwd(), 'builds'),
+    iconPath,
+    taskId,
+    permissions,
+    pwa,
+    onProgress,
+  } = options;
+
+  let pwaResult: PwaExportResult | undefined;
+
+  try {
+    // Validate ZIP file exists
+    if (!(await fs.pathExists(zipPath))) {
+      return { success: false, error: `ZIP file not found: ${zipPath}` };
+    }
+
+    onProgress?.('Checking build environment...', 5);
+
+    // Check Android SDK
+    const sdkInfo = await detectAndroidSdk();
+    if (!sdkInfo.isValid) {
+      return { success: false, error: 'Android SDK not found. Please set ANDROID_HOME.' };
+    }
+    setupAndroidEnv(sdkInfo.androidHome);
+
+    // Check Cordova
+    const cordovaInfo = await detectCordova();
+    if (!cordovaInfo.isInstalled) {
+      onProgress?.('Installing Cordova CLI...', 10);
+      await execaCommand('npm install -g cordova');
+    }
+
+    // Create work directory
+    const safeAppName = sanitizeDirName(appName);
+    const workDir = path.join(outputDir, `${safeAppName}-html-build`);
+    await fs.remove(workDir);
+    await fs.ensureDir(workDir);
+
+    onProgress?.('Extracting project files...', 15);
+
+    // Extract ZIP to temp location
+    const extractDir = path.join(workDir, 'extracted');
+    await fs.ensureDir(extractDir);
+    await runUnzip(['-q', zipPath, '-d', extractDir]);
+
+    // Find the actual project root
+    let projectDir = extractDir;
+    if (projectRoot) {
+      projectDir = path.join(extractDir, projectRoot);
+    } else {
+      // Auto-detect: look for index.html
+      const entries = await fs.readdir(extractDir, { withFileTypes: true });
+
+      // Check if index.html is at root
+      if (await fs.pathExists(path.join(extractDir, 'index.html'))) {
+        projectDir = extractDir;
+      } else {
+        // Check subdirectories
+        for (const entry of entries) {
+          if (entry.isDirectory()) {
+            const subPath = path.join(extractDir, entry.name, 'index.html');
+            if (await fs.pathExists(subPath)) {
+              projectDir = path.join(extractDir, entry.name);
+              break;
+            }
+          }
+        }
+      }
+    }
+
+    // Verify index.html exists
+    const indexHtmlPath = path.join(projectDir, 'index.html');
+    if (!(await fs.pathExists(indexHtmlPath))) {
+      // Try to find any HTML file
+      const htmlFiles = await findHtmlFiles(projectDir);
+      if (htmlFiles.length === 0) {
+        return { success: false, error: 'No index.html or HTML files found in the project' };
+      }
+      // Use the first HTML file and rename it
+      const firstHtml = htmlFiles[0];
+      await fs.move(firstHtml, indexHtmlPath);
+      onProgress?.(`Using ${path.basename(firstHtml)} as entry point`, 18);
+    }
+
+    if (pwa) {
+      const siteDir = path.join(pwa.outputDir, pwa.siteId);
+      onProgress?.('Exporting PWA site...', 20);
+      try {
+        await fs.remove(siteDir);
+        await fs.ensureDir(siteDir);
+        await fs.copy(projectDir, siteDir, {
+          filter: (src) => {
+            const relativePath = path.relative(projectDir, src);
+            return !relativePath.includes('node_modules') &&
+              !path.basename(src).startsWith('.') &&
+              !relativePath.includes('__MACOSX');
+          },
+        });
+        await addPwaSupport(siteDir, { appName, iconPath });
+        pwaResult = { siteId: pwa.siteId, siteDir, success: true };
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        pwaResult = { siteId: pwa.siteId, siteDir, success: false, error: message };
+        onProgress?.(`PWA export failed: ${message}`, 20);
+      }
+    }
+
+    onProgress?.('Creating Cordova project...', 25);
+
+    // Create Cordova project in a separate directory
+    const cordovaDir = path.join(workDir, 'cordova');
+    await fs.ensureDir(cordovaDir);
+
+    await execa('cordova', ['create', '.', appId, appName, '--no-telemetry'], {
+      cwd: cordovaDir,
+    });
+
+    onProgress?.('Installing cordova-android...', 32);
+
+    await execa('pnpm', ['add', 'cordova-android@14', '-D', '--ignore-workspace'], {
+      cwd: cordovaDir,
+      timeout: 120000,
+    });
+
+    onProgress?.('Adding Android platform...', 38);
+
+    await execa('cordova', ['platform', 'add', 'android', '--no-telemetry'], {
+      cwd: cordovaDir,
+      timeout: 60000,
+    });
+
+    // Inject app icon
+    onProgress?.('Injecting app icon...', 42);
+    await injectIcon(cordovaDir, iconPath, onProgress, 42);
+
+    // Inject custom permissions (if any)
+    if (permissions && permissions.length > 0) {
+      onProgress?.('Configuring app permissions...', 43);
+      await injectPermissions(cordovaDir, permissions, onProgress, 43);
+    }
+
+    // Update config.xml with app version
+    onProgress?.('Setting app version...', 44);
+    const configXmlPath = path.join(cordovaDir, 'config.xml');
+    if (await fs.pathExists(configXmlPath)) {
+      let configContent = await fs.readFile(configXmlPath, 'utf8');
+      // Update version attribute in widget tag
+      configContent = configContent.replace(
+        /(<widget[^>]*version=")[^"]*(")/,
+        `$1${appVersion}$2`
+      );
+      // If version attribute doesn't exist, add it
+      if (!configContent.includes('version="')) {
+        configContent = configContent.replace(
+          /(<widget[^>]*)(>)/,
+          `$1 version="${appVersion}"$2`
+        );
+      }
+      await fs.writeFile(configXmlPath, configContent);
+    }
+
+    onProgress?.('Copying web resources...', 50);
+
+    // Clear www and copy all project files
+    const wwwDir = path.join(cordovaDir, 'www');
+    await fs.emptyDir(wwwDir);
+
+    // Copy all files from project directory
+    await fs.copy(projectDir, wwwDir, {
+      filter: (src) => {
+        // Skip node_modules and hidden files
+        const relativePath = path.relative(projectDir, src);
+        return !relativePath.includes('node_modules') &&
+          !path.basename(src).startsWith('.') &&
+          !relativePath.includes('__MACOSX');
+      },
+    });
+
+    // Process index.html for Cordova
+    let indexHtml = await fs.readFile(path.join(wwwDir, 'index.html'), 'utf8');
+    indexHtml = prepareHtmlForCordova(indexHtml);
+    await fs.writeFile(path.join(wwwDir, 'index.html'), indexHtml);
+    await writeDemo2apkRuntimeScript(wwwDir);
+
+    onProgress?.('Syncing resources to Android platform...', 60);
+
+    await execa('cordova', ['prepare', 'android', '--no-telemetry'], {
+      cwd: cordovaDir,
+    });
+
+    await patchCordovaAndroidMainActivityForBlobSave(path.join(cordovaDir, 'platforms', 'android'), appId, onProgress, 62);
+
+    await applyAndroidSystemBarTheme({
+      androidDir: path.join(cordovaDir, 'platforms', 'android'),
+      themeNames: ['AppTheme'],
+      color: extractThemeColor(indexHtml) ?? DEFAULT_SYSTEM_BAR_COLOR,
+      onProgress,
+    });
+
+    // 与单文件分支同一套修复，同样排在主题之后
+    await applyClassicSystemBars({
+      androidDir: path.join(cordovaDir, 'platforms', 'android'),
+      appId,
+      onProgress,
+    });
+
+    if (await setAndroidTargetSdk(path.join(cordovaDir, 'platforms', 'android'))) {
+      onProgress?.(`Set targetSdkVersion to ${ANDROID_TARGET_SDK} for classic system bars`);
+    }
+
+    onProgress?.('Setting up Gradle...', 65);
+
+    const androidDir = path.join(cordovaDir, 'platforms', 'android');
+    await ensureGradleWrapper(androidDir, onProgress, 65);
+
+    onProgress?.('Building APK (this may take a few minutes)...', 75);
+
+    const gradleExe = process.platform === 'win32'
+      ? path.join(os.homedir(), '.gradle', 'gradle-dist', `gradle-${GRADLE_VERSION}`, 'bin', 'gradle.bat')
+      : './gradlew';
+    await execa(gradleExe, ['assembleDebug', '--no-daemon'], {
+      cwd: androidDir,
+      env: {
+        ...process.env,
+        JAVA_HOME: process.env.JAVA_HOME || path.join(os.homedir(), '.jdks', 'jdk-21.0.11+10'),
+        GRADLE_OPTS: '-Xmx1024m -Dorg.gradle.jvmargs="-Xmx1024m -XX:+HeapDumpOnOutOfMemoryError"',
+      },
+    });
+
+    onProgress?.('Exporting APK...', 95);
+
+    const apkSource = path.join(
+      androidDir,
+      'app',
+      'build',
+      'outputs',
+      'apk',
+      'debug',
+      'app-debug.apk'
+    );
+
+    if (!(await fs.pathExists(apkSource))) {
+      return { success: false, error: 'APK build failed - output file not found' };
+    }
+
+    const apkFileName = taskId ? `${appName}--${taskId}.apk` : `${appName}.apk`;
+    const apkDest = path.join(outputDir, apkFileName);
+    await fs.copy(apkSource, apkDest);
+
+    // Verify copy
+    const destStats = await fs.stat(apkDest);
+    const sourceStats = await fs.stat(apkSource);
+    if (destStats.size !== sourceStats.size) {
+      return { success: false, error: 'APK copy verification failed' };
+    }
+
+    // Optionally cleanup Cordova work directory (build artifacts)
+    if (shouldCleanupBuildArtifacts()) {
+      try {
+        await fs.remove(workDir);
+      } catch {
+        // Non-fatal – ignore cleanup errors
+      }
+    }
+
+    const duration = Date.now() - startTime;
+
+    onProgress?.('Build completed!', 100);
+
+    return {
+      success: true,
+      apkPath: apkDest,
+      duration,
+      pwa: pwaResult,
+    };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    return {
+      success: false,
+      error: message,
+      duration: Date.now() - startTime,
+      pwa: pwaResult,
+    };
+  }
+}
+
+/**
+ * Recursively find HTML files in a directory
+ */
+async function findHtmlFiles(dir: string): Promise<string[]> {
+  const htmlFiles: string[] = [];
+
+  async function scan(currentDir: string) {
+    const entries = await fs.readdir(currentDir, { withFileTypes: true });
+
+    for (const entry of entries) {
+      const fullPath = path.join(currentDir, entry.name);
+
+      if (entry.isDirectory() && !entry.name.startsWith('.') && entry.name !== 'node_modules') {
+        await scan(fullPath);
+      } else if (entry.isFile()) {
+        const ext = path.extname(entry.name).toLowerCase();
+        if (ext === '.html' || ext === '.htm') {
+          htmlFiles.push(fullPath);
+        }
+      }
+    }
+  }
+
+  await scan(dir);
+  return htmlFiles;
+}

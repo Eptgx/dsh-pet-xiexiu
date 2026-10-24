@@ -1,0 +1,2 @@
+/* 自动生成：scripts/make-placeholder.py */
+window.PET_CONFIG = {"version":1,"source":"placeholder","size":320,"files":{"占位角色":"a001"},"talkAnims":["占位角色"],"animations":{"idle":["占位角色"],"turn":["占位角色"],"drag":["占位角色"],"clicks":["占位角色"],"moves":{"default":{},"actions":[]},"categories":[]},"animationWeights":{"idle":10,"turn":5,"move":5},"physics":{}};
