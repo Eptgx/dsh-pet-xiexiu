@@ -10,6 +10,17 @@
 > A desktop pet for Android, split into a reusable overlay framework and a
 > Windows-local APK packager. The packager is generic and runs standalone.
 
+## 上游项目
+
+本仓库基于两个 MIT 项目，是在它们之上的二次开发与整合，**非官方分支**：
+
+| 项目 | 开源地址 | 在本仓库中的角色 |
+|---|---|---|
+| **dsh-pet** | <https://github.com/PC2005-cloud/dsh-pet> | 桌宠悬浮窗框架的上游 |
+| **demo2apk** | <https://github.com/DeadWaveWave/demo2apk> | Windows 本地打包器的上游 |
+
+> 版权与许可归各自作者所有；本仓库的修改同样以 MIT 发布，见 [LICENSE](LICENSE)。
+
 ## 两者怎么配合
 
 ```
